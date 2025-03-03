@@ -81,6 +81,7 @@ struct RMM{
 struct segment{
     struct {
         uint64_t line_id:           32;
+        uint64_t ptn_id:            32;
         uint64_t RMM_number:        32;
         uint64_t segment_number:    32;
         //uint64_t next_segment_id:   32;   //simply adopt the QTAILQ structure
@@ -211,6 +212,9 @@ struct ssdparams {
     int tt_luns;      /* total # of LUNs in the SSD */
 
     int tt_remote_pgs;
+
+    int luns_per_ptn;         /* # of LUNs in one partition */
+    int tt_ptns;              /* # of partitions in the SSD */
 };
 
 typedef struct line {
@@ -264,8 +268,8 @@ struct ssd {
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
     struct rmap_elem *rmap;     /* reverse mapptbl, assume it's stored in OOB */
-    struct write_pointer wp;
-    struct line_mgmt lm;
+    struct write_pointer *wp;
+    struct line_mgmt *lm;
     uint16_t id; /* unique id for synchronization */
     uint64_t next_ssd_avail_time;
 
@@ -280,7 +284,7 @@ struct ssd {
     uint64_t cur_write_number;
     int last_print_time_s;
     struct segment_mgmt segment_management;
-    struct write_pointer wp_RMM;
+    struct write_pointer *wp_RMM;
     struct ppa *remote_maptbl;  /* X-to-1 direct mapping table of remote LPN space */
     struct femu_mbe remote_parity_mbe;
     struct ppa *GC_migration_mappings; //records the mapping between old_ppa and new_ppa when GC, for updating RMMs

@@ -781,6 +781,8 @@ typedef struct NvmeRequest {
 
     /* position in the priority queue for delay emulation */
     size_t                  pos;
+
+    // uint8_t FP[16];  // 16字节指纹,用于分区选择
 } NvmeRequest;
 
 typedef struct DMAOff {
