@@ -1029,13 +1029,10 @@ static void *ftl_thread(void *arg)
 
         /* clean one line if needed (in the background) */
         if(req->opcode == NVME_CMD_WRITE) {
-            // uint64_t fp_value = 0;
-            // int ptn_id;
-            // memcpy(&fp_value, req->FP, sizeof(uint64_t));
-            // ptn_id = fp_value % ssd->sp.tt_ptns;
-            int ptn_id = (ptn_num + ssd->sp.tt_ptns - 1) % ssd->sp.tt_ptns;
-            if (should_gc(ssd, ptn_id)) {
-                do_gc(ssd, ptn_id, false);
+            for(int i = 0; i < ssd->sp.tt_ptns; i++) {
+                if (should_gc(ssd, i)) {
+                    do_gc(ssd, i, false);
+                }
             }
         }
     }
@@ -1095,10 +1092,6 @@ uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     int ptn_id;
     /* TODO: writes need to go to cache first */
     /* ... */
-    // memcpy(&fp_value, req->FP, sizeof(uint64_t));
-    // ptn_id = fp_value % spp->tt_ptns;
-    ptn_id = ptn_num;
-    ptn_num = (ptn_num + 1) % ssd->sp.tt_ptns;
 
     if (end_lpn >= spp->tt_pgs) {
         printf("ERRRRRRRRRR,start_lpn=%"PRIu64",end_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, end_lpn, ssd->sp.tt_pgs);
@@ -1106,18 +1099,20 @@ uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     //assert(end_lpn < spp->tt_pgs);
     //printf("Coperd,%s,end_lpn=%"PRIu64" (%d),len=%d\n", __func__, end_lpn, spp->tt_pgs, len);
 
-    while (should_gc_high(ssd, ptn_id)) {
-        /* perform GC here until !should_gc(ssd) */
-        //printf("FEMU: FTL doing blocking GC\n");
-        r = do_gc(ssd, ptn_id, true);
-        if (r == -1)
-            break;
-    }
-
     /* on cache eviction, write to NAND page */
-
     // are we doing fresh writes ? maptbl[lpn] == FREE, pick a new page
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        ptn_id = ptn_num;
+        ptn_num = (ptn_num + 1) % ssd->sp.tt_ptns;
+
+        while (should_gc_high(ssd, ptn_id)) {
+            /* perform GC here until !should_gc(ssd) */
+            //printf("FEMU: FTL doing blocking GC\n");
+            r = do_gc(ssd, ptn_id, true);
+            if (r == -1)
+                break;
+        }
+
         struct rmap_elem elem;
         elem.lpn = lpn;
         elem.RMM_page_p = NULL;
