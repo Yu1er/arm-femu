@@ -5,6 +5,7 @@
 #include "../nvme.h"
 #include "ftl.h"
 #include <execinfo.h>
+#include "MD5.h"
 
 uint16_t ssd_count = 0;
 int ptn_num = 0;
@@ -443,9 +444,11 @@ static void ssd_init_rmap(struct ssd *ssd)
     }
 }
 
-void ssd_init(struct ssd *ssd)
+// void ssd_init(struct ssd *ssd)
+void ssd_init(FemuCtrl *n)
 {
     int i;
+    struct ssd *ssd = &(n->ssd);
     struct ssdparams *spp = &ssd->sp;
 
     assert(ssd);
@@ -485,7 +488,8 @@ void ssd_init(struct ssd *ssd)
 
     ptn_num = 0;
 
-    qemu_thread_create(&ssd->ftl_thread, "ftl_thread", ftl_thread, ssd,
+    // qemu_thread_create(&ssd->ftl_thread, "ftl_thread", ftl_thread, ssd,
+    qemu_thread_create(&ssd->ftl_thread, "ftl_thread", ftl_thread, n,
             QEMU_THREAD_JOINABLE);
 }
 
@@ -951,7 +955,9 @@ static int do_gc(struct ssd *ssd, int ptn_id, bool force)
 
 static void *ftl_thread(void *arg)
 {
-    struct ssd *ssd = (struct ssd *)arg;
+    // struct ssd *ssd = (struct ssd *)arg;
+    FemuCtrl *n = (FemuCtrl *)arg;
+    struct ssd *ssd = &(n->ssd);
     NvmeRequest *req = NULL;
     uint64_t lat = 0;
     int rc;
@@ -985,7 +991,8 @@ static void *ftl_thread(void *arg)
         switch (req->opcode) {
             case NVME_CMD_WRITE:
                 // my_log(ssd->fp_latency, "receive IO(Write):%ld,\t", req->slba);
-                lat = ssd_write(ssd, req);
+                // lat = ssd_write(ssd, req);
+                lat = ssd_write(n, ssd, req);
                 break;
             case NVME_CMD_READ:
                 // my_log(ssd->fp_latency, "receive IO(Read):%ld,\t", req->slba);
@@ -1029,13 +1036,11 @@ static void *ftl_thread(void *arg)
 
         /* clean one line if needed (in the background) */
         if(req->opcode == NVME_CMD_WRITE) {
-            // uint64_t fp_value = 0;
-            // int ptn_id;
-            // memcpy(&fp_value, req->FP, sizeof(uint64_t));
-            // ptn_id = fp_value % ssd->sp.tt_ptns;
-            int ptn_id = (ptn_num + ssd->sp.tt_ptns - 1) % ssd->sp.tt_ptns;
-            if (should_gc(ssd, ptn_id)) {
-                do_gc(ssd, ptn_id, false);
+            // int ptn_id = (ptn_num + ssd->sp.tt_ptns - 1) % ssd->sp.tt_ptns;
+            for(int i = 0;i < ssd->sp.tt_ptns;i++) {
+                if (should_gc(ssd, i)) {
+                    do_gc(ssd, i, false);
+                }
             }
         }
     }
@@ -1080,7 +1085,8 @@ uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
     return maxlat;
 }
 
-uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
+// uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
+uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
 {
     uint64_t lba = req->slba;
     struct ssdparams *spp = &ssd->sp;
@@ -1095,10 +1101,6 @@ uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     int ptn_id;
     /* TODO: writes need to go to cache first */
     /* ... */
-    // memcpy(&fp_value, req->FP, sizeof(uint64_t));
-    // ptn_id = fp_value % spp->tt_ptns;
-    ptn_id = ptn_num;
-    ptn_num = (ptn_num + 1) % ssd->sp.tt_ptns;
 
     if (end_lpn >= spp->tt_pgs) {
         printf("ERRRRRRRRRR,start_lpn=%"PRIu64",end_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, end_lpn, ssd->sp.tt_pgs);
@@ -1106,18 +1108,38 @@ uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     //assert(end_lpn < spp->tt_pgs);
     //printf("Coperd,%s,end_lpn=%"PRIu64" (%d),len=%d\n", __func__, end_lpn, spp->tt_pgs, len);
 
-    while (should_gc_high(ssd, ptn_id)) {
-        /* perform GC here until !should_gc(ssd) */
-        //printf("FEMU: FTL doing blocking GC\n");
-        r = do_gc(ssd, ptn_id, true);
-        if (r == -1)
-            break;
-    }
+    NvmeRwCmd *rw = (NvmeRwCmd *)(&(req->cmd));
+    uint64_t slba = le64_to_cpu(rw->slba);
+    NvmeNamespace *ns = req->ns;
+    const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
+    const uint8_t data_shift = ns->id_ns.lbaf[lba_index].ds;
+    uint64_t data_offset = slba << data_shift;
+    
+    QEMUSGList *qsg = &req->qsg;
+    int sg_cur_index = 0;
+    dma_addr_t sg_cur_byte = 0;
+    dma_addr_t cur_len;
+    void *mb = n->mbe.mem_backend;
 
     /* on cache eviction, write to NAND page */
 
     // are we doing fresh writes ? maptbl[lpn] == FREE, pick a new page
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        my_assert(ssd, sg_cur_index < qsg->nsg, "Error: sg_cur_index >= qsg->nsg");
+        cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
+        getMd5(mb + data_offset, 16, req->FP);
+        memcpy(&fp_value, req->FP, sizeof(uint64_t));
+        ptn_id = fp_value % (uint64_t)spp->tt_ptns;
+        ssd->ptns[ptn_id]++;
+
+        while (should_gc_high(ssd, ptn_id)) {
+            /* perform GC here until !should_gc(ssd) */
+            //printf("FEMU: FTL doing blocking GC\n");
+            r = do_gc(ssd, ptn_id, true);
+            if (r == -1)
+                break;
+        }
+
         struct rmap_elem elem;
         elem.lpn = lpn;
         elem.RMM_page_p = NULL;
@@ -1147,8 +1169,16 @@ uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         /* get latency statistics */
         curlat = ssd_advance_status(ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
+
+        sg_cur_byte += cur_len;
+        if (sg_cur_byte == qsg->sg[sg_cur_index].len) {
+            sg_cur_byte = 0;
+            ++sg_cur_index;
+        }
+        data_offset += cur_len;
     }
 
+    qemu_sglist_destroy(qsg);
     return maxlat;
 }
 
@@ -1374,6 +1404,11 @@ inline void printf_info(struct ssd *ssd, bool force_print)
             ssd->type_page_count[RMMpage], (float)ssd->type_page_count[RMMpage]*4/1024/1024,
             ssd->g_malloc_RMM_pages, ssd->g_free_RMM_pages,
             ssd->cpu_cycle_tt);
+
+        // for(int i=0;i<ssd->sp.tt_ptns;i++) {
+        //     my_log(ssd->fp_info, "ptn_%d = %d, ", i, ssd->ptns[i]);
+        // }
+        // my_log(ssd->fp_info, "ptn_31 = %d\n", ssd->ptns[ssd->sp.tt_ptns]);
 
         ssd->tt_IOs[LAST_SECOND][NAND_READ][USER_IO] = ssd->tt_IOs[LAST_SECOND][NAND_WRITE][USER_IO] = ssd->tt_IOs[LAST_SECOND][NAND_READ][METADATA_IO] = ssd->tt_IOs[LAST_SECOND][NAND_WRITE][METADATA_IO] = 0;
         ssd->tt_GC_IOs[LAST_SECOND][NAND_READ] = ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE] = ssd->tt_GC_IOs[LAST_SECOND][NAND_ERASE] = 0;

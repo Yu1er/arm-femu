@@ -314,6 +314,8 @@ struct ssd {
 
     uint64_t wait_migrate_RMMs;
     uint64_t do_migrate_RMMs;
+
+    uint64_t ptns[64];
 };
 
 extern uint16_t ssd_id_cnt;

@@ -1,1 +1,2 @@
 obj-y += ftl.o
+obj-y += MD5.o

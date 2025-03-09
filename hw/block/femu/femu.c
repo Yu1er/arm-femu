@@ -695,6 +695,7 @@ void nvme_process_sq_io(void *opaque)
         /* Coperd: record req->stime at earliest convenience */
         req->expire_time = req->stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         req->cqe.cid = cmd.cid;
+        memcpy(&req->cmd, &cmd, sizeof(NvmeCmd));
 
         /* Coperd: For TIFA */
         req->tifa_cmd_flag = ((NvmeRwCmd *)&cmd)->rsvd2;
@@ -1322,7 +1323,8 @@ static int femu_init(PCIDevice *pci_dev)
         ssd->dataplane_started_ptr = &n->dataplane_started;
         ssd->ssdname = (char *)n->devname;
         printf("FEMU: starting in blackbox SSD mode ..\n");
-        ssd_init(ssd);
+        // ssd_init(ssd);
+        ssd_init(n);
         static struct ssd *last_ssd_p = NULL;
         if(last_ssd_p == NULL)  {
             last_ssd_p = ssd;

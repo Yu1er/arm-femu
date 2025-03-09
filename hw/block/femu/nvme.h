@@ -757,6 +757,7 @@ typedef struct NvmeRequest {
     void                    *meta_buf;
     uint64_t                femu_oc_slba;
     uint64_t                *femu_oc_ppa_list;
+    NvmeCmd                 cmd;
     NvmeCqe                 cqe;
     QEMUSGList              qsg;
     QEMUIOVector            iov;
@@ -782,7 +783,7 @@ typedef struct NvmeRequest {
     /* position in the priority queue for delay emulation */
     size_t                  pos;
 
-    // uint8_t FP[16];  // 16字节指纹,用于分区选择
+    uint8_t FP[16];  // 16字节指纹,用于分区选择
 } NvmeRequest;
 
 typedef struct DMAOff {
@@ -981,9 +982,10 @@ static inline bool OCSSD(FemuCtrl *n)
     return (n->femu_mode == FEMU_WHITEBOX_MODE);
 }
 
-extern void ssd_init(struct ssd *ssd);
+// extern void ssd_init(struct ssd *ssd);
+extern void ssd_init(FemuCtrl *n);
 extern uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req);
-extern uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req);
+extern uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req);
 
 
 extern void femu_oc_exit(FemuCtrl *n);
