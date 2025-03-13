@@ -28,6 +28,12 @@ uint64_t ssd_remote_read(struct ssd *ssd, NvmeRequest *req);    //18 Lines
 uint64_t ssd_dedup_write(struct ssd *ssd, NvmeRequest *req);    //56 Lines
 // uint64_t ssd_remote_parity_write(struct ssd *ssd, NvmeRequest *req);    
 uint64_t ssd_trim(struct ssd *ssd, NvmeRequest *req);   //64 Lines
+void allocate_FP_pages(struct ssd *ssd, struct line *data_line);
+void write_FP_page(struct ssd *ssd, struct ppa *ppa);
+void set_FP(struct ssd *ssd, struct ppa *ppa, uint8_t *FP, int ptn_id);
+void ssd_init_write_FP_pointer(struct ssd *ssd);
+void ssd_init_FP_page(struct ssd *ssd);
+void FP_migration(struct ssd *ssd, struct line *line, int ptn_id);
 
 /* 打印调用栈的最大深度 */
 #define DUMP_STACK_DEPTH_MAX 16
@@ -83,6 +89,7 @@ static inline bool should_gc_high(struct ssd *ssd, int ptn_id)
 inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn, bool if_remote_lpn)
 {
     my_assert(ssd, lpn != RMM_PAGE, "error, there is no maptbl for RMM_PAGE\n");
+    my_assert(ssd, lpn != FP_PAGE, "error, there is no maptbl for FP_PAGE\n");
     if(if_remote_lpn)                    return ssd->remote_maptbl[lpn];
     else if(lpn >= ssd->sp.tt_pgs)       return ssd->remote_maptbl[lpn % ssd->sp.tt_pgs];   //remote parity
     else                                 return ssd->maptbl[lpn];
@@ -90,7 +97,7 @@ inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn, bool if_remote_l
 
 static inline void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, bool if_remote_lpn, struct ppa *ppa)
 {
-    if (lpn == RMM_PAGE) 
+    if (lpn == RMM_PAGE || lpn == FP_PAGE) 
         return;
     
     my_assert(ssd, lpn != INVALID_LPN, "Error, it is an INVALID_LPN in set_maptbl_ent()");
@@ -160,7 +167,9 @@ static void ssd_init_lines(struct ssd *ssd)
             /* wen:added  Remap-SSD */
             QTAILQ_INIT(&line->segment_group_list);
             QTAILQ_INIT(&line->RMM_page_list);
+            QTAILQ_INIT(&line->FP_page_list);
             line->is_RMM_line = false;
+            line->is_FP_line = false;
             line->segment_count_inNVRAM = 0;
             line->next_segment_id = 0;
         }
@@ -198,7 +207,7 @@ static inline void check_addr(int a, int max)
     assert(a >= 0 && a < max);
 }
 
-static struct line *get_next_free_line(struct ssd *ssd, int ptn_id, bool is_RMM_page)
+static struct line *get_next_free_line(struct ssd *ssd, int ptn_id, bool is_RMM_page, bool is_FP_page)
 {
     struct line_mgmt *lm = &ssd->lm[ptn_id];
     struct line *curline = NULL;
@@ -213,13 +222,19 @@ static struct line *get_next_free_line(struct ssd *ssd, int ptn_id, bool is_RMM_
     lm->free_line_cnt--;
     /* wen:added  Remap-SSD */
     curline->is_RMM_line = is_RMM_page;
+    curline->is_FP_line = is_FP_page;
+
+    if(is_RMM_page == false && is_FP_page == false) {
+        allocate_FP_pages(ssd, curline);
+    }
+
     return curline;
 }
 
-static void ssd_advance_write_pointer(struct ssd *ssd, int ptn_id, bool is_RMM_page)
+static void ssd_advance_write_pointer(struct ssd *ssd, int ptn_id, bool is_RMM_page, bool is_FP_page)
 {
     struct ssdparams *spp = &ssd->sp;
-    struct write_pointer *wpp = is_RMM_page ? &ssd->wp_RMM[ptn_id] : &ssd->wp[ptn_id];
+    struct write_pointer *wpp = is_RMM_page ? &ssd->wp_RMM[ptn_id] : is_FP_page ? &ssd->wp_FP[ptn_id] : &ssd->wp[ptn_id];
     struct line_mgmt *lm = &ssd->lm[ptn_id];
 
     wpp->lun++;
@@ -240,16 +255,23 @@ static void ssd_advance_write_pointer(struct ssd *ssd, int ptn_id, bool is_RMM_p
                 assert(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
                 /* there must be some invalid pages in this line */
                 //printf("Coperd,curline,vpc:%d,ipc:%d\n", wpp->curline->vpc, wpp->curline->ipc);
-                my_assert(ssd, wpp->curline->ipc > 0, "error line, id=%d, vpc=%d, ipc=%d, is_RMM_line=%d, is_RMM_page=%d\n", 
-                    wpp->curline->id, wpp->curline->vpc, wpp->curline->ipc, wpp->curline->is_RMM_line, is_RMM_page);
+                my_assert(ssd, wpp->curline->ipc > 0, "error line, id=%d, vpc=%d, ipc=%d, is_RMM_line=%d, is_RMM_page=%d, is_FP_line=%d, is_FP_page=%d\n", 
+                    wpp->curline->id, wpp->curline->vpc, wpp->curline->ipc, wpp->curline->is_RMM_line, is_RMM_page, wpp->curline->is_FP_line, is_FP_page);
                 QTAILQ_INSERT_TAIL(&lm->victim_line_list, wpp->curline, entry);
                 lm->victim_line_cnt++;
             }
+            // // 将数据行的指纹页写入
+            // if(is_RMM_page == false && is_FP_page == false) {
+            //     struct FP_page *FP_page;
+            //     QTAILQ_FOREACH(FP_page, &wpp->curline->FP_page_list, entry) {
+            //         write_FP_page(ssd, &FP_page->ppa);
+            //     }
+            // }
             /* current line is used up, pick another empty line */
             check_addr(wpp->blk, spp->blks_per_pl);
             /* TODO: how should we choose the next block for writes */
             wpp->curline = NULL;
-            wpp->curline = get_next_free_line(ssd, ptn_id, is_RMM_page);
+            wpp->curline = get_next_free_line(ssd, ptn_id, is_RMM_page, is_FP_page);
             if (!wpp->curline) {
                 printf("ssd_advance_write_pointer calling abort\n");
                 abort();
@@ -267,9 +289,9 @@ static void ssd_advance_write_pointer(struct ssd *ssd, int ptn_id, bool is_RMM_p
     //printf("Next,ch:%d,lun:%d,blk:%d,pg:%d\n", wpp->ch, wpp->lun, wpp->blk, wpp->pg);
 }
 
-static struct ppa get_new_page(struct ssd *ssd, int ptn_id, bool is_RMM_page)
+static struct ppa get_new_page(struct ssd *ssd, int ptn_id, bool is_RMM_page, bool is_FP_page)
 {
-    struct write_pointer *wpp = is_RMM_page ? &ssd->wp_RMM[ptn_id] : &ssd->wp[ptn_id];
+    struct write_pointer *wpp = is_RMM_page ? &ssd->wp_RMM[ptn_id] : is_FP_page ? &ssd->wp_FP[ptn_id] : &ssd->wp[ptn_id];
     struct ppa ppa;
     ppa.ppa = 0;
     ppa.g.ch = wpp->lun / ssd->sp.luns_per_ch;
@@ -330,7 +352,7 @@ static void ssd_init_params(struct ssdparams *spp)
     spp->tt_luns = spp->luns_per_ch * spp->nchs;
 
     /* 初始化分区参数 */
-    spp->luns_per_ptn = 2;  // 每个分区包含2个LUN，可配置
+    spp->luns_per_ptn = 64;  // 每个分区包含2个LUN，可配置
     spp->tt_ptns = spp->tt_luns / spp->luns_per_ptn;  // 总分区数
     
     /* 确保LUN数量能被分区大小整除 */
@@ -441,6 +463,7 @@ static void ssd_init_rmap(struct ssd *ssd)
     for (i = 0; i < spp->tt_pgs; i++) {
         ssd->rmap[i].lpn = INVALID_LPN;
         ssd->rmap[i].RMM_page_p = NULL;
+        ssd->rmap[i].FP_page_p = NULL;
     }
 }
 
@@ -486,6 +509,8 @@ void ssd_init(FemuCtrl *n)
     ssd_init_write_RMM_pointer(ssd);
     ssd_init_GC_migration_mappins(ssd);
 
+    ssd_init_write_FP_pointer(ssd);
+    ssd_init_FP_page(ssd);
     ptn_num = 0;
 
     // qemu_thread_create(&ssd->ftl_thread, "ftl_thread", ftl_thread, ssd,
@@ -514,7 +539,7 @@ inline bool valid_ppa(struct ssd *ssd, struct ppa *ppa)
 
 static inline bool valid_lpn(struct ssd *ssd, uint64_t lpn)
 {
-    return (lpn < ssd->sp.tt_pgs || lpn == RMM_PAGE);
+    return (lpn < ssd->sp.tt_pgs || lpn == RMM_PAGE || lpn == FP_PAGE);
 }
 
 inline bool mapped_ppa(struct ppa *ppa)
@@ -760,7 +785,7 @@ static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
 }
 
 /* move valid page data (already in DRAM) from victim line to a new page */
-static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa, bool is_RMM_page)
+static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa, bool is_RMM_page, bool is_FP_page)
 {
     struct ppa new_ppa;
     struct ssd_channel *new_ch;
@@ -778,7 +803,7 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa, bool is_RMM_
     }
     else {
         int ptn_id = (old_ppa->g.ch * ssd->sp.luns_per_ch + old_ppa->g.lun) / ssd->sp.luns_per_ptn;
-        new_ppa = get_new_page(ssd, ptn_id, is_RMM_page);
+        new_ppa = get_new_page(ssd, ptn_id, is_RMM_page, is_FP_page);
 
         if(elem.lpn == RMM_PAGE) {
             my_assert(ssd, is_RMM_page, "Error: elem.lpn == RMM_PAGE but it is not a RMM_PAGE");
@@ -791,8 +816,22 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa, bool is_RMM_
         }
         //may not rmap in M-Table (elem.lpn == INVALID_LPN), but there are multiple rmaps in R-Table whose updates of reference are processed in RMM_migration function
         //elem.lpn != INVALID_LPN
+        else if(elem.lpn == FP_PAGE) {
+            my_assert(ssd, is_FP_page, "Error: elem.lpn == FP_PAGE but it is not a FP_PAGE");
+            my_assert(ssd, elem.FP_page_p != NULL, "Error: elem.FP_page_p is NULL");
+            my_assert(ssd, elem.FP_page_p->ppa.ppa == old_ppa->ppa, "Error: elem.FP_page_p->ppa.ppa != old_ppa->ppa");
+            delete_reference(ssd, false, old_ppa, elem);
+            my_assert(ssd, get_pg(ssd, old_ppa)->refcount == 0, "Error: get_pg(ssd, old_ppa)->refcount != 0");
+            elem.FP_page_p->ppa = new_ppa;
+            add_reference(ssd, false, &new_ppa, true, elem);
+            ssd->tt_GC_IOs[LAST_SECOND][3]++;
+            ssd->tt_GC_IOs[LAST_SECOND][4]++;
+            ssd->tt_GC_IOs[TOTAL][3]++;
+            ssd->tt_GC_IOs[TOTAL][4]++;
+        }
         else {
             my_assert(ssd, elem.RMM_page_p == NULL, "Error: elem.RMM_page_p is not NULL");
+            my_assert(ssd, elem.FP_page_p == NULL, "Error: elem.FP_page_p is not NULL");
             delete_reference(ssd, false, old_ppa, elem);
             ssd->wait_migrate_RMMs += get_pg(ssd, old_ppa)->refcount;
             ssd->GC_migration_mappings[ppa_to_OffsetInLine(ssd, old_ppa)] = new_ppa;
@@ -802,14 +841,16 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa, bool is_RMM_
         //thus, reference update of these remap-lpns is completed in segment_migration()
 
         /* need to advance the write pointer here */
-        ssd_advance_write_pointer(ssd, ptn_id, is_RMM_page);
+        ssd_advance_write_pointer(ssd, ptn_id, is_RMM_page, is_FP_page);
 
-        ssd->tt_GC_IOs[TOTAL][NAND_WRITE]++;
-        ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE]++;
-        struct nand_cmd gcw;
-        gcw.cmd = NAND_WRITE;
-        gcw.stime = 0;
-        ssd_advance_status(ssd, &new_ppa, &gcw);
+        // if(is_FP_page == false){
+            ssd->tt_GC_IOs[TOTAL][NAND_WRITE]++;
+            ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE]++;
+            struct nand_cmd gcw;
+            gcw.cmd = NAND_WRITE;
+            gcw.stime = 0;
+            ssd_advance_status(ssd, &new_ppa, &gcw);
+        // }
         return 0;
     }
 }
@@ -839,7 +880,7 @@ static struct line *select_victim_line(struct ssd *ssd, int ptn_id, bool force)
     if(!victim_line)
         return NULL;
 
-    if (!force && victim_line->ipc < ssd->sp.pgs_per_line / 4) {
+    if (!force && victim_line->ipc < ssd->sp.pgs_per_line / 8) {
         //printf("Coperd,select a victim line: ipc=%d (< 1/8), pgs_per_line=%d\n", victim_line->ipc, ssd->sp.pgs_per_line);
         return NULL;
     }
@@ -854,7 +895,7 @@ static struct line *select_victim_line(struct ssd *ssd, int ptn_id, bool force)
 
 /* here ppa identifies the block we want to clean 
     Returns the number of valid pages we needed to copy within the block*/
-static int clean_one_block(struct ssd *ssd, struct ppa *ppa, bool is_RMM_block)
+static int clean_one_block(struct ssd *ssd, struct ppa *ppa, bool is_RMM_block, bool is_FP_block)
 {
     struct ssdparams *spp = &ssd->sp;
     struct nand_block *blk = get_blk(ssd, ppa);
@@ -870,21 +911,28 @@ static int clean_one_block(struct ssd *ssd, struct ppa *ppa, bool is_RMM_block)
         assert(pg_iter->status != PG_FREE);
         if (pg_iter->status == PG_VALID) {
             my_assert(ssd, pg_iter->refcount > 0, "error, refcount of a valid page (ppa=%lu) is %d\n", ppa->ppa, pg_iter->refcount);
-            gc_read_page(ssd, ppa);
+            if(is_FP_block == false)
+                gc_read_page(ssd, ppa);
             /* delay the maptbl update until "write" happens */
-            gc_write_page(ssd, ppa, is_RMM_block);
+            gc_write_page(ssd, ppa, is_RMM_block, is_FP_block);
             cnt++;
         }
     }
 
     my_assert(ssd, old_blk_vpc == cnt, "valid_pages=%d, migrate_pages=%d\n", old_blk_vpc, cnt);
+    // if(is_FP_block)
+    //     ssd->FP_GC_luns[ppa->g.ch * spp->luns_per_ch + ppa->g.lun] += cnt;
+    if(is_FP_block == false)
+        ssd->data_GC_luns[ppa->g.ch * spp->luns_per_ch + ppa->g.lun] += cnt;
     /* do we do "erase" here? */
-    ssd->tt_GC_IOs[TOTAL][NAND_ERASE]++;
-    ssd->tt_GC_IOs[LAST_SECOND][NAND_ERASE]++;
-    struct nand_cmd gce;
-    gce.cmd = NAND_ERASE;
-    gce.stime = 0;
-    ssd_advance_status(ssd, ppa, &gce);
+    if(is_FP_block == false){
+        ssd->tt_GC_IOs[TOTAL][NAND_ERASE]++;
+        ssd->tt_GC_IOs[LAST_SECOND][NAND_ERASE]++;
+        struct nand_cmd gce;
+        gce.cmd = NAND_ERASE;
+        gce.stime = 0;
+        ssd_advance_status(ssd, ppa, &gce);
+    }
     return cnt;
 }
 
@@ -901,6 +949,7 @@ static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
         "error in mark_line_free, line->segment_count_inNVRAM(%d) != 0\n", line->segment_count_inNVRAM);
     line->next_segment_id = 0;
     line->is_RMM_line = false;
+    line->is_FP_line = false;
     /* move this line to free line list */
     QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
     lm->free_line_cnt++;
@@ -925,18 +974,76 @@ static int do_gc(struct ssd *ssd, int ptn_id, bool force)
     ppa.g.blk = victim_line->id;
     /* copy back valid data */
     // for (ch = 0; ch < spp->nchs; ch++) {
-    for (lun = ptn_id * spp->luns_per_ptn; lun < ptn_id * spp->luns_per_ptn + spp->luns_per_ptn; lun++) {
-        ppa.g.ch = lun / spp->luns_per_ch;
-        ppa.g.lun = lun % spp->luns_per_ch;
-        ppa.g.pl = 0;
-        chp = get_ch(ssd, &ppa);
-        lunp = get_lun(ssd, &ppa);
-        clean_one_block(ssd, &ppa, victim_line->is_RMM_line);
+    if(victim_line->is_FP_line){
+        struct nand_page *pg_iter = NULL;
+        struct write_pointer *wpp = &ssd->wp_FP[ptn_id];
+        my_log(ssd->fp_info, "wp_FP in line when trigger FP GC= %d, line_id = %d \n", (wpp->pg - 1) * spp->luns_per_ptn + wpp->ch * spp->luns_per_ch + wpp->lun, wpp->curline->id);
+        for(int pg = 0; pg < spp->pgs_per_blk ; pg++){
+            for (lun = ptn_id * spp->luns_per_ptn; lun < ptn_id * spp->luns_per_ptn + spp->luns_per_ptn; lun++) {
+                ppa.g.ch = lun / spp->luns_per_ch;
+                ppa.g.lun = lun % spp->luns_per_ch;
+                ppa.g.pl = 0;
+                ppa.g.pg = pg;
+                pg_iter = get_pg(ssd, &ppa);
+                assert(pg_iter->status != PG_FREE);
+                if (pg_iter->status == PG_VALID) {
+                    my_assert(ssd, pg_iter->refcount > 0, "error, refcount of a valid page (ppa=%lu) is %d\n", ppa.ppa, pg_iter->refcount);
+                    // if(is_FP_block == false)
+                    gc_read_page(ssd, &ppa);
+                    /* delay the maptbl update until "write" happens */
+                    gc_write_page(ssd, &ppa, victim_line->is_RMM_line, victim_line->is_FP_line);
+                    ssd->FP_GC_luns[lun] ++;
+                }
+
+            }
+        }
     }
+    else{
+        for (lun = ptn_id * spp->luns_per_ptn; lun < ptn_id * spp->luns_per_ptn + spp->luns_per_ptn; lun++) {
+            ppa.g.ch = lun / spp->luns_per_ch;
+            ppa.g.lun = lun % spp->luns_per_ch;
+            ppa.g.pl = 0;
+            chp = get_ch(ssd, &ppa);
+            lunp = get_lun(ssd, &ppa);
+            clean_one_block(ssd, &ppa, victim_line->is_RMM_line, victim_line->is_FP_line);
+        }
+    }
+    // }
+    if(victim_line->is_FP_line){
+        int total = 0;
+        struct write_pointer *wpp = &ssd->wp_FP[ptn_id];
+        for(int i = 0;i < spp->tt_luns / 2; i++){
+            total += ssd->FP_GC_luns[i];
+            my_log(ssd->fp_info, "luns[%d]:%d, ", i, ssd->FP_GC_luns[i]);
+            ssd->FP_GC_luns[i] = 0;
+        }
+        my_log(ssd->fp_info,"\n");
+        for(int i = spp->tt_luns / 2;i < spp->tt_luns; i++){
+            total += ssd->FP_GC_luns[i];
+            my_log(ssd->fp_info, "luns[%d]:%d, ", i, ssd->FP_GC_luns[i]);
+            ssd->FP_GC_luns[i] = 0;
+        }
+        my_log(ssd->fp_info,"\ntotal = %d, line_id = %d\n\n", total, wpp->curline->id);
+    }
+    // else{
+    //     int total = 0;
+    //     for(int i = 0;i < spp->tt_luns / 2; i++){
+    //         total += ssd->data_GC_luns[i];
+    //         my_log(ssd->fp_info, "luns[%d]:%d, ", i, ssd->data_GC_luns[i]);
+    //         ssd->data_GC_luns[i] = 0;
+    //     }
+    //     my_log(ssd->fp_info,"\n");
+    //     for(int i = spp->tt_luns / 2;i < spp->tt_luns; i++){
+    //         total += ssd->data_GC_luns[i];
+    //         my_log(ssd->fp_info, "luns[%d]:%d, ", i, ssd->data_GC_luns[i]);
+    //         ssd->data_GC_luns[i] = 0;
+    //     }
+    //     my_log(ssd->fp_info,"total data GC = %d\n\n", total);
     // }
 
     /* wen:added  Remap-SSD */
     segmentgroup_migration(ssd, victim_line);
+    FP_migration(ssd, victim_line, ptn_id);
     ssd_init_GC_migration_mappins(ssd);
 
     /* update line status */
@@ -1143,6 +1250,7 @@ uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
         struct rmap_elem elem;
         elem.lpn = lpn;
         elem.RMM_page_p = NULL;
+        elem.FP_page_p = NULL;
 
         ppa = get_maptbl_ent(ssd, lpn, false);
         if (mapped_ppa(&ppa)) {
@@ -1154,12 +1262,15 @@ uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
 
         /* new write */
         /* find a new page */
-        ppa = get_new_page(ssd, ptn_id, false);
+        ppa = get_new_page(ssd, ptn_id, false, false);
 
         add_reference(ssd, false, &ppa, true, elem);
 
+        // 设置物理页对应的指纹
+        set_FP(ssd, &ppa, req->FP, ptn_id);
+
         /* need to advance the write pointer here */
-        ssd_advance_write_pointer(ssd, ptn_id, false);
+        ssd_advance_write_pointer(ssd, ptn_id, false, false);
 
         ssd->tt_IOs[TOTAL][NAND_WRITE][lpn >= ssd->metadata_offset ? USER_IO : METADATA_IO]++;
         ssd->tt_IOs[LAST_SECOND][NAND_WRITE][lpn >= ssd->metadata_offset ? USER_IO : METADATA_IO]++;
@@ -1220,6 +1331,7 @@ uint64_t ssd_dedup_write(struct ssd *ssd, NvmeRequest *req)
     struct rmap_elem elem;
     elem.lpn = req->is_remote_slba ? req->remote_entry_offset : local_lpn;
     elem.RMM_page_p = NULL;
+    elem.FP_page_p = NULL;
 
     struct ppa old_ppa = get_maptbl_ent(ssd, elem.lpn, req->is_remote_slba);
     if (mapped_ppa(&old_ppa)) {
@@ -1311,8 +1423,9 @@ uint64_t ssd_trim(struct ssd *ssd, NvmeRequest *req)
         if(req->special_value == -1) {
             ssd->test_begin = true;
             memset(ssd->tt_IOs, 0, sizeof(int)*2*2*2);
-            memset(ssd->tt_GC_IOs, 0, sizeof(int)*2*3);
+            memset(ssd->tt_GC_IOs, 0, sizeof(int)*2*5);
             memset(ssd->tt_RMM_IOs, 0, sizeof(int)*2*2);
+            memset(ssd->tt_FP_IOs, 0, sizeof(int)*2*2);
             memset(ssd->tt_remaps, 0, sizeof(int)*2);
             memset(ssd->tt_trims, 0, sizeof(int)*2);
             // ssd->tt_IOs[TOTAL][NAND_READ][USER_IO] = ssd->tt_IOs[TOTAL][NAND_READ][METADATA_IO] = ssd->tt_IOs[TOTAL][NAND_WRITE][USER_IO] = ssd->tt_IOs[TOTAL][NAND_WRITE][METADATA_IO] = ssd->tt_IOs[LAST_SECOND][NAND_READ][USER_IO] = ssd->tt_IOs[LAST_SECOND][NAND_READ][METADATA_IO] = ssd->tt_IOs[LAST_SECOND][NAND_WRITE][USER_IO] = ssd->tt_IOs[LAST_SECOND][NAND_WRITE][METADATA_IO] = 0;
@@ -1325,6 +1438,8 @@ uint64_t ssd_trim(struct ssd *ssd, NvmeRequest *req)
             ssd->valid_RMMs = 0;
             ssd->valid_RMM_pages = 0;
             ssd->cpu_cycle_tt = 0;
+            ssd->valid_FPs = 0;
+            ssd->valid_FP_pages = 0;
             uint64_t current_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
             current_time = (current_time > ssd->next_ssd_avail_time ? current_time : ssd->next_ssd_avail_time);
             my_log(ssd->fp_info, "%s:%lu\n", "TestBegin", current_time/1e9);
@@ -1371,6 +1486,7 @@ uint64_t ssd_trim(struct ssd *ssd, NvmeRequest *req)
     struct rmap_elem elem;
     elem.lpn = lpn;
     elem.RMM_page_p = NULL;
+    elem.FP_page_p = NULL;
     delete_reference(ssd, req->is_remote_slba, &ppa, elem);
 
     printf_info(ssd, false);
@@ -1385,24 +1501,33 @@ inline void printf_info(struct ssd *ssd, bool force_print)
         my_log(ssd->fp_info, "time:%d, \
             tt_IOs:(%d,%d),(%d,%d),(%d,%d),(%d,%d), \
             tt_GC_IOs:(%d,%d,%d),(%d,%d,%d), \
+            tt_FP_GC_IOs:(%d,%d),(%d,%d), \
             tt_RMM_IOs:(%d,%d),(%d,%d), \
+            tt_FP_IOs:(%d,%d),(%d,%d), \
             tt_remaps:%d(%d), \
             R_MapTable_entris:%d(%d), RMMs:%d, RMM_pages:%d, \
+            valid_FPs:%d, valid_FP_pages:%d, \
             TRIMs:%d(%d), \
-            metadata_pages:%d(%.2fGB), user_pages:%d(%.2fGB), RMM_pages:%d(%.2fGB),\
+            metadata_pages:%d(%.2fGB), user_pages:%d(%.2fGB), RMM_pages:%d(%.2fGB), FP_pages:%d(%.2fGB),\
             RMM_pages:(malloc,%d)(free,%d),\
+            FP_pages:(malloc,%d)(free,%d),\
             cpu_cycle_tt:%ld\n",
             time_s, 
             ssd->tt_IOs[TOTAL][NAND_READ][USER_IO], ssd->tt_IOs[TOTAL][NAND_WRITE][USER_IO], ssd->tt_IOs[LAST_SECOND][NAND_READ][USER_IO], ssd->tt_IOs[LAST_SECOND][NAND_WRITE][USER_IO], ssd->tt_IOs[TOTAL][NAND_READ][METADATA_IO], ssd->tt_IOs[TOTAL][NAND_WRITE][METADATA_IO], ssd->tt_IOs[LAST_SECOND][NAND_READ][METADATA_IO], ssd->tt_IOs[LAST_SECOND][NAND_WRITE][METADATA_IO],
             ssd->tt_GC_IOs[TOTAL][NAND_READ], ssd->tt_GC_IOs[TOTAL][NAND_WRITE], ssd->tt_GC_IOs[TOTAL][NAND_ERASE], ssd->tt_GC_IOs[LAST_SECOND][NAND_READ], ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE], ssd->tt_GC_IOs[LAST_SECOND][NAND_ERASE],
+            ssd->tt_GC_IOs[TOTAL][3], ssd->tt_GC_IOs[TOTAL][4], ssd->tt_GC_IOs[LAST_SECOND][3], ssd->tt_GC_IOs[LAST_SECOND][4],
             ssd->tt_RMM_IOs[TOTAL][NAND_READ], ssd->tt_RMM_IOs[TOTAL][NAND_WRITE], ssd->tt_RMM_IOs[LAST_SECOND][NAND_READ], ssd->tt_RMM_IOs[LAST_SECOND][NAND_WRITE],
+            ssd->tt_FP_IOs[TOTAL][NAND_READ], ssd->tt_FP_IOs[TOTAL][NAND_WRITE], ssd->tt_FP_IOs[LAST_SECOND][NAND_READ], ssd->tt_FP_IOs[LAST_SECOND][NAND_WRITE],
             ssd->tt_remaps[TOTAL], ssd->tt_remaps[LAST_SECOND], 
             ssd->used_R_MapTable_entris, ssd->used_R_MapTable_parity_entris, ssd->valid_RMMs, ssd->valid_RMM_pages,
+            ssd->valid_FPs, ssd->valid_FP_pages,
             ssd->tt_trims[TOTAL], ssd->tt_trims[LAST_SECOND],
             ssd->type_page_count[metapage], (float)ssd->type_page_count[metapage]*4/1024/1024, 
             ssd->type_page_count[userpage], (float)ssd->type_page_count[userpage]*4/1024/1024,
             ssd->type_page_count[RMMpage], (float)ssd->type_page_count[RMMpage]*4/1024/1024,
+            ssd->type_page_count[FPpage], (float)ssd->type_page_count[FPpage]*4/1024/1024,
             ssd->g_malloc_RMM_pages, ssd->g_free_RMM_pages,
+            ssd->g_malloc_FP_pages, ssd->g_free_FP_pages,
             ssd->cpu_cycle_tt);
 
         // for(int i=0;i<ssd->sp.tt_ptns;i++) {
@@ -1411,8 +1536,9 @@ inline void printf_info(struct ssd *ssd, bool force_print)
         // my_log(ssd->fp_info, "ptn_31 = %d\n", ssd->ptns[ssd->sp.tt_ptns]);
 
         ssd->tt_IOs[LAST_SECOND][NAND_READ][USER_IO] = ssd->tt_IOs[LAST_SECOND][NAND_WRITE][USER_IO] = ssd->tt_IOs[LAST_SECOND][NAND_READ][METADATA_IO] = ssd->tt_IOs[LAST_SECOND][NAND_WRITE][METADATA_IO] = 0;
-        ssd->tt_GC_IOs[LAST_SECOND][NAND_READ] = ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE] = ssd->tt_GC_IOs[LAST_SECOND][NAND_ERASE] = 0;
+        ssd->tt_GC_IOs[LAST_SECOND][NAND_READ] = ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE] = ssd->tt_GC_IOs[LAST_SECOND][NAND_ERASE] = ssd->tt_GC_IOs[LAST_SECOND][3] = ssd->tt_GC_IOs[LAST_SECOND][4] = 0;
         ssd->tt_RMM_IOs[LAST_SECOND][NAND_READ] = ssd->tt_RMM_IOs[LAST_SECOND][NAND_WRITE] = 0;
+        ssd->tt_FP_IOs[LAST_SECOND][NAND_READ] = ssd->tt_FP_IOs[LAST_SECOND][NAND_WRITE] = 0;
         ssd->tt_remaps[LAST_SECOND] = 0;
         ssd->tt_trims[LAST_SECOND] = 0;
     }
@@ -1430,19 +1556,19 @@ inline void add_reference(struct ssd *ssd, bool if_remote_lpn, struct ppa *ppa, 
     if(pg->refcount++ ==0) {
         mark_page_valid(ssd, ppa);
         my_assert(ssd, get_rmap_ent(ssd, ppa).lpn == INVALID_LPN, "Wrong add_reference, there is a rmap(lpn=%d, tt_pgs=%d) in this ppa!\n", get_rmap_ent(ssd, ppa).lpn, ssd->sp.tt_pgs);
-        ssd->type_page_count[line->is_RMM_line ? RMMpage : if_remote_lpn ? userpage : elem.lpn >= ssd->metadata_offset ? userpage : metapage]++;
+        ssd->type_page_count[line->is_RMM_line ? RMMpage : line->is_FP_line ? FPpage : if_remote_lpn ? userpage : elem.lpn >= ssd->metadata_offset ? userpage : metapage]++;
     }
 
     set_maptbl_ent(ssd, elem.lpn, if_remote_lpn, ppa);
     if(if_rmap)
         set_rmap_ent(ssd, elem, ppa);
 
-    if(if_remote_lpn || elem.lpn >= ssd->sp.tt_pgs) {
-        if(elem.lpn >= ssd->sp.tt_pgs)
-            ssd->used_R_MapTable_parity_entris++;
-        else 
-            ssd->used_R_MapTable_entris++;
-    }
+    // if(if_remote_lpn || elem.lpn >= ssd->sp.tt_pgs) {
+    //     if(elem.lpn >= ssd->sp.tt_pgs)
+    //         ssd->used_R_MapTable_parity_entris++;
+    //     else 
+    //         ssd->used_R_MapTable_entris++;
+    // }
 
     debug_log(ssd->fp_debug_info, "add_reference: if_remote_lpn:%s != elem.lpn(%d) or + tt_pgs(%d), cur_lpn(%d), ppa(%d)\n", 
         if_remote_lpn ? "true" : "false", elem.lpn, ssd->sp.tt_pgs, get_rmap_ent(ssd, ppa).lpn, ppa->ppa);
@@ -1459,7 +1585,7 @@ inline void delete_reference(struct ssd *ssd, bool if_remote_lpn, struct ppa *pp
     my_assert(ssd, pg->refcount > 0, "Wrong delete_reference 2, ref=%d!\n", pg->refcount);
     if(--pg->refcount == 0) {
         mark_page_invalid(ssd, ppa);
-        ssd->type_page_count[line->is_RMM_line ? RMMpage : if_remote_lpn ? userpage : elem.lpn >= ssd->metadata_offset ? userpage : metapage]--;
+        ssd->type_page_count[line->is_RMM_line ? RMMpage : line->is_FP_line ? FPpage : if_remote_lpn ? userpage : elem.lpn >= ssd->metadata_offset ? userpage : metapage]--;
     }
 
     struct rmap_elem old_elem = get_rmap_ent(ssd, ppa); 
@@ -1469,14 +1595,26 @@ inline void delete_reference(struct ssd *ssd, bool if_remote_lpn, struct ppa *pp
         struct rmap_elem new_elem; 
         new_elem.lpn = INVALID_LPN;
         new_elem.RMM_page_p = NULL;
+        new_elem.FP_page_p = NULL;
+        set_rmap_ent(ssd, new_elem, ppa);
+    }
+    else if(line->is_FP_line) {
+        my_assert(ssd, elem.lpn == FP_PAGE, "Error: it is a FP_PAGE but elem.lpn != FP_PAGE");
+        my_assert(ssd, elem.FP_page_p != NULL, "Error: it is a FP_PAGE but elem.FP_page_p == NULL");
+        struct rmap_elem new_elem; 
+        new_elem.lpn = INVALID_LPN;
+        new_elem.RMM_page_p = NULL;
+        new_elem.FP_page_p = NULL;
         set_rmap_ent(ssd, new_elem, ppa);
     }
     else if(!if_remote_lpn && old_elem.lpn == elem.lpn) {
         my_assert(ssd, elem.lpn != RMM_PAGE, "Error: it is not a RMM_Line but elem.lpn == RMM_PAGE");
+        my_assert(ssd, elem.lpn != FP_PAGE, "Error: it is not a FP_Line but elem.lpn == FP_PAGE");
         my_assert(ssd, elem.lpn != INVALID_LPN, "Error: it is not a RMM_Line but elem.lpn == INVALID_LPN");
         struct rmap_elem new_elem; 
         new_elem.lpn = INVALID_LPN;
         new_elem.RMM_page_p = NULL;
+        new_elem.FP_page_p = NULL;
         set_rmap_ent(ssd, new_elem, ppa);
     }
     else if(old_elem.lpn != INVALID_LPN && old_elem.lpn >= ssd->sp.tt_pgs) {        //remote parity
@@ -1486,6 +1624,7 @@ inline void delete_reference(struct ssd *ssd, bool if_remote_lpn, struct ppa *pp
         struct rmap_elem new_elem; 
         new_elem.lpn = INVALID_LPN;
         new_elem.RMM_page_p = NULL;
+        new_elem.FP_page_p = NULL;
         set_rmap_ent(ssd, new_elem, ppa);
     }
     //otherwise, it is a remap-lpn, its rmap is in RMM(updated in segment_migration) instead of rmap_ent(updated here)
@@ -1494,12 +1633,12 @@ inline void delete_reference(struct ssd *ssd, bool if_remote_lpn, struct ppa *pp
     unmapped_ppa.ppa = UNMAPPED_PPA;
     set_maptbl_ent(ssd, elem.lpn, if_remote_lpn, &unmapped_ppa);
 
-    if(if_remote_lpn || (elem.lpn >= ssd->sp.tt_pgs && (elem.lpn - ssd->sp.tt_pgs) <= ssd->sp.tt_remote_pgs) || old_elem.lpn == elem.lpn + ssd->sp.tt_pgs) {
-        if(elem.lpn >= ssd->sp.tt_pgs || old_elem.lpn == elem.lpn + ssd->sp.tt_pgs)
-            ssd->used_R_MapTable_parity_entris--;
-        else 
-            ssd->used_R_MapTable_entris--;
-    }
+    // if(if_remote_lpn || (elem.lpn >= ssd->sp.tt_pgs && (elem.lpn - ssd->sp.tt_pgs) <= ssd->sp.tt_remote_pgs) || old_elem.lpn == elem.lpn + ssd->sp.tt_pgs) {
+    //     if(elem.lpn >= ssd->sp.tt_pgs || old_elem.lpn == elem.lpn + ssd->sp.tt_pgs)
+    //         ssd->used_R_MapTable_parity_entris--;
+    //     else 
+    //         ssd->used_R_MapTable_entris--;
+    // }
 
     debug_log(ssd->fp_debug_info, "delete_reference: old_elem.lpn(%d, if_remote_lpn:%s) != elem.lpn(%d) or + tt_pgs(%d), cur_lpn(%d), ppa(%d)\n", 
             old_elem.lpn, if_remote_lpn ? "true" : "false", elem.lpn, ssd->sp.tt_pgs, get_rmap_ent(ssd, ppa).lpn, ppa->ppa);
@@ -1547,7 +1686,7 @@ inline struct RMM_page *get_RMM_page(struct ssd *ssd, int ptn_id)
 {
     struct RMM_page *RMM_page = g_malloc0(sizeof(struct RMM_page));
     ssd->g_malloc_RMM_pages++;
-    RMM_page->ppa = get_new_page(ssd, ptn_id, true);
+    RMM_page->ppa = get_new_page(ssd, ptn_id, true, false);
     return RMM_page;
 }
 
@@ -1556,10 +1695,11 @@ void flush_RMM_page(struct ssd *ssd, struct RMM_page *RMM_page, int ptn_id)
     struct rmap_elem elem;
     elem.lpn = RMM_PAGE;
     elem.RMM_page_p = RMM_page;
+    elem.FP_page_p = NULL;
 
     struct ppa *ppa = &RMM_page->ppa;
     add_reference(ssd, false, ppa, true, elem);
-    ssd_advance_write_pointer(ssd, ptn_id, true);
+    ssd_advance_write_pointer(ssd, ptn_id, true, false);
 
     struct nand_cmd nvrd;
     nvrd.stime = 0;
@@ -1758,13 +1898,14 @@ void RMM_migration(struct ssd *ssd, struct RMM *RMM, int line_id, int ptn_id)
     struct rmap_elem elem;
     elem.lpn = RMM->target_LPN;
     elem.RMM_page_p = NULL;
+    elem.FP_page_p = NULL;
     delete_reference(ssd, RMM->if_remote_lpn, &old_ppa, elem);
 
     if(new_ppa.ppa == DELAY_WRITE) {
-        new_ppa = get_new_page(ssd, ptn_id, false);
+        new_ppa = get_new_page(ssd, ptn_id, false, false);
         ssd->GC_migration_mappings[RMM->offset] = new_ppa;
         add_reference(ssd, RMM->if_remote_lpn, &new_ppa, false, elem);
-        ssd_advance_write_pointer(ssd, ptn_id, false);
+        ssd_advance_write_pointer(ssd, ptn_id, false, false);
 
         ssd->tt_GC_IOs[TOTAL][NAND_WRITE]++;
         ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE]++;
@@ -1852,6 +1993,7 @@ void segmentgroup_migration(struct ssd *ssd, struct line *line)
         struct rmap_elem elem;
         elem.lpn = RMM_PAGE;
         elem.RMM_page_p = RMM_page;
+        elem.FP_page_p = NULL;
         delete_reference(ssd, false, &RMM_page->ppa, elem);
         g_free(RMM_page);
         ssd->valid_RMM_pages--;
@@ -1860,4 +2002,199 @@ void segmentgroup_migration(struct ssd *ssd, struct line *line)
 
     my_assert(ssd, ssd->wait_migrate_RMMs == ssd->do_migrate_RMMs, "Error: ssd->wait_migrate_RMMs(%d) != do_migrate_RMMs(%d)", 
         ssd->wait_migrate_RMMs, ssd->do_migrate_RMMs);
+}
+
+inline struct FP_page *get_FP_page(struct ssd *ssd, int ptn_id)
+{
+    struct FP_page *FP_page = g_malloc0(sizeof(struct FP_page));
+    ssd->g_malloc_FP_pages++;
+    FP_page->ppa = get_new_page(ssd, ptn_id, false, true);
+    return FP_page;
+}
+
+inline void get_FP_location(struct ssd *ssd, uint64_t page_offset, 
+                                 int *FP_page_idx, int *FP_entry_idx) {
+    int entries_per_page = FPs_Per_Page;
+    *FP_page_idx = page_offset / entries_per_page;
+    *FP_entry_idx = page_offset % entries_per_page;
+}
+
+void allocate_FP_pages(struct ssd *ssd, struct line *data_line)
+{
+    struct FP_page *FP_page = NULL;
+    int ptn_id = data_line->id % ssd->sp.tt_ptns;
+    if (QTAILQ_EMPTY(&data_line->FP_page_list)) {
+        int needed_pages = ssd->sp.pgs_per_line / FPs_Per_Page;
+        for (int i = 0; i < needed_pages; i++) {
+            FP_page = get_FP_page(ssd, ptn_id);
+            QTAILQ_INSERT_TAIL(&data_line->FP_page_list, FP_page, entry);
+
+            // 提前将数据行的指纹页写入的时间线往后推
+            write_FP_page(ssd, &FP_page->ppa);
+            
+            // 更新引用计数
+            struct rmap_elem elem;
+            elem.lpn = FP_PAGE;
+            elem.RMM_page_p = NULL;
+            elem.FP_page_p = FP_page;
+
+            struct ppa *ppa = &FP_page->ppa;
+            // ssd->FP_aloc_luns[ppa->g.ch * ssd->sp.luns_per_ch + ppa->g.lun]++;
+            add_reference(ssd, false, ppa, true, elem);
+            ssd_advance_write_pointer(ssd, ptn_id, false, true);
+        }
+    }
+    // for(int i=0; i<ssd->sp.luns_per_ptn; i++){
+    //     my_log(ssd->fp_info, "alloc[%d]:%d, ", i, ssd->FP_aloc_luns[i]);
+    //     ssd->FP_aloc_luns[i] = 0;
+    // }
+    // my_log(ssd->fp_info, "\n");
+}
+
+inline void read_FP_page(struct ssd *ssd, struct ppa *ppa)
+{
+    ssd->tt_FP_IOs[TOTAL][NAND_READ]++;
+    ssd->tt_FP_IOs[LAST_SECOND][NAND_READ]++;
+    struct nand_cmd srd;
+    srd.cmd = NAND_READ;
+    srd.stime = 0;
+    ssd_advance_status(ssd, ppa, &srd);
+}
+
+void write_FP_page(struct ssd *ssd, struct ppa *ppa)
+{
+    ssd->tt_FP_IOs[TOTAL][NAND_WRITE]++;
+    ssd->tt_FP_IOs[LAST_SECOND][NAND_WRITE]++;
+    ssd->valid_FP_pages++;
+    struct nand_cmd swr;
+    swr.stime = 0;
+    swr.cmd = NAND_WRITE;
+    ssd_advance_status(ssd, ppa, &swr);
+}
+
+void set_FP(struct ssd *ssd, struct ppa *ppa, uint8_t *FP, int ptn_id)
+{
+    uint64_t page_offset = ppa_to_OffsetInLine(ssd, ppa);
+
+    // 计算指纹存储位置
+    int FP_page_idx, FP_entry_idx;
+    get_FP_location(ssd, page_offset, &FP_page_idx, &FP_entry_idx);
+
+    // 获取目标指纹页
+    struct FP_page *FP_page;
+    struct line_mgmt *lm = &ssd->lm[ptn_id];
+    FP_page = QTAILQ_FIRST(&lm->lines[ppa->g.blk].FP_page_list);
+    for(int i = 0; i < FP_page_idx; i++) {
+        FP_page = QTAILQ_NEXT(FP_page, entry);
+    }
+
+    memcpy(FP_page->FP_entrys[FP_entry_idx].FP, FP, FP_SIZE);
+    ssd->valid_FPs++;
+}
+
+void ssd_init_write_FP_pointer(struct ssd *ssd)
+{
+    ssd->wp_FP = g_malloc0(sizeof(struct write_pointer) * ssd->sp.tt_ptns);
+    for(int ptn_id = 0; ptn_id < ssd->sp.tt_ptns; ptn_id++) {
+        struct write_pointer *wpp = &ssd->wp_FP[ptn_id];
+        struct line_mgmt *lm = &ssd->lm[ptn_id];
+        struct line *curline = NULL;
+
+        /* make sure lines are already initialized by now */
+        curline = QTAILQ_FIRST(&lm->free_line_list);
+        QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
+        lm->free_line_cnt--;
+        /* wpp->curline is always our onging line for writes */
+        wpp->curline = curline;
+        wpp->ch = 0;
+        wpp->lun = ptn_id * ssd->sp.luns_per_ptn;
+        wpp->pg = 0;
+        wpp->blk = curline->id;;
+        wpp->pl = 0;
+
+        curline->is_FP_line = true;
+    }
+}
+
+void ssd_init_FP_page(struct ssd *ssd)
+{
+    for(int ptn_id = 0; ptn_id < ssd->sp.tt_ptns; ptn_id++) {
+        struct write_pointer *wpp = &ssd->wp[ptn_id];
+        struct line *curline = wpp->curline;
+        allocate_FP_pages(ssd, curline);
+    }
+}
+
+void FP_migration(struct ssd *ssd, struct line *line, int ptn_id)
+{
+    int valid = 0;
+    struct FP_page *old_FP_page, *new_FP_page;
+    if(line->is_FP_line)
+        return;
+
+    QTAILQ_FOREACH(old_FP_page, &line->FP_page_list, entry) {
+        read_FP_page(ssd, &old_FP_page->ppa);
+    }
+
+    for(int offset = 0; offset < ssd->sp.pgs_per_line; offset++) {
+        struct ppa old_ppa = OffsetInLine_to_ppa(ssd, offset, line->id, ptn_id);
+        struct ppa new_ppa = ssd->GC_migration_mappings[offset];
+        if(new_ppa.ppa == UNMAPPED_PPA) {
+            ssd->valid_FPs--;
+            continue;
+        }
+        valid ++;
+        // 计算指纹在old_line指纹页中的位置
+        int old_FP_page_idx, old_FP_entry_idx;
+        get_FP_location(ssd, offset, &old_FP_page_idx, &old_FP_entry_idx);
+        
+        // 获取对应的old指纹页
+        old_FP_page = QTAILQ_FIRST(&line->FP_page_list);
+        for(int i = 0; i < old_FP_page_idx; i++) {
+            old_FP_page = QTAILQ_NEXT(old_FP_page, entry);
+        }
+
+        // 获取new_line
+        struct line *new_line = get_line(ssd, &new_ppa);
+        int new_offset = ppa_to_OffsetInLine(ssd, &new_ppa);
+
+        // 计算指纹在new_line指纹页中的位置
+        int new_FP_page_idx, new_FP_entry_idx;
+        get_FP_location(ssd, new_offset, &new_FP_page_idx, &new_FP_entry_idx);
+
+        // 获取对应的new指纹页
+        new_FP_page = QTAILQ_FIRST(&new_line->FP_page_list);
+        for(int i = 0; i < new_FP_page_idx; i++) {
+            new_FP_page = QTAILQ_NEXT(new_FP_page, entry);
+        }
+
+        // 迁移指纹
+        memcpy(new_FP_page->FP_entrys[new_FP_entry_idx].FP,
+               old_FP_page->FP_entrys[old_FP_entry_idx].FP,
+               FP_SIZE);
+    }
+
+    // 释放旧指纹页
+    while(!QTAILQ_EMPTY(&line->FP_page_list)) {
+        old_FP_page = QTAILQ_FIRST(&line->FP_page_list);
+        QTAILQ_REMOVE(&line->FP_page_list, old_FP_page, entry);
+
+        // ssd->FP_mig_luns[old_FP_page->ppa.g.ch * ssd->sp.luns_per_ch + old_FP_page->ppa.g.lun]++;
+
+        // 删除旧页引用
+        struct rmap_elem elem;
+        elem.lpn = FP_PAGE;
+        elem.RMM_page_p = NULL;
+        elem.FP_page_p = old_FP_page;
+        delete_reference(ssd, false, &old_FP_page->ppa, elem);
+
+        g_free(old_FP_page);
+        ssd->valid_FP_pages--;
+        ssd->g_free_FP_pages++;
+    }
+    // for(int i=0; i<ssd->sp.luns_per_ptn; i++){
+    //     my_log(ssd->fp_info, "migs[%d]:%d, ", i, ssd->FP_mig_luns[i]);
+    //     ssd->FP_mig_luns[i] = 0;
+    // }
+    // my_log(ssd->fp_info, "\nvalid = %d\n",valid);
 }

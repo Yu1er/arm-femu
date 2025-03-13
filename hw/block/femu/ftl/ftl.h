@@ -9,6 +9,7 @@
 #define UNMAPPED_PPA    (~(0ULL))
 #define UNALLOCATED_SEGMENT    (~(0ULL))
 #define RMM_PAGE        (~(1ULL))
+#define FP_PAGE         (~(2ULL))
 #define UNKNOW          (~(0ULL))
 #define DELAY_WRITE     (~(1ULL))
 
@@ -54,7 +55,7 @@ enum {
 #define metapage 0
 #define userpage 1
 #define RMMpage 2
-
+#define FPpage 3
 #define KB      (1024)
 #define MB      (1024*KB)
 #define GB      (1024*MB)
@@ -123,6 +124,18 @@ struct RMM_page{
     struct segment segments[Segments_Per_Page];
     struct ppa ppa;
     QTAILQ_ENTRY(RMM_page) entry;
+};
+
+#define FP_SIZE 16
+struct FP_entry {
+    uint8_t FP[FP_SIZE];
+};
+
+#define FPs_Per_Page (Page_Size/sizeof(struct FP_entry))
+struct FP_page {
+    struct FP_entry FP_entrys[FPs_Per_Page];  // 指纹条目数组
+    struct ppa ppa;                           // 该页的物理地址
+    QTAILQ_ENTRY(FP_page) entry;              // 用于链表
 };
 
 typedef int nand_sec_status_t;
@@ -227,6 +240,8 @@ typedef struct line {
     int next_segment_id;
     QTAILQ_HEAD(RMM_page_list, RMM_page) RMM_page_list;      //stored in flash
     bool is_RMM_line;
+    QTAILQ_HEAD(FP_page_list, FP_page) FP_page_list;      //stored in flash
+    bool is_FP_line;
     int segment_count_inNVRAM;
 } line;
 
@@ -260,6 +275,7 @@ struct nand_cmd {
 struct rmap_elem {
     uint64_t lpn;
     struct RMM_page* RMM_page_p;
+    struct FP_page* FP_page_p;
 };
 
 struct ssd {
@@ -289,6 +305,8 @@ struct ssd {
     struct femu_mbe remote_parity_mbe;
     struct ppa *GC_migration_mappings; //records the mapping between old_ppa and new_ppa when GC, for updating RMMs
 
+    struct write_pointer *wp_FP;
+
     //statistics
     char info_file_name[100];
     FILE* fp_info;
@@ -296,10 +314,10 @@ struct ssd {
     char latency_file_name[100];
     FILE* fp_latency;
     uint64_t metadata_offset;
-    uint64_t type_page_count[3];    //[metadata, userdata, RMM]
+    uint64_t type_page_count[4];    //[metadata, userdata, RMM, FP]
     bool test_begin;    //begin to collect statistic information
     uint64_t tt_IOs[2][2][2];   //[TOTAL, LAST_SECOND][READ, WRITE][User, Metadata]
-    uint64_t tt_GC_IOs[2][3];
+    uint64_t tt_GC_IOs[2][5];
     uint64_t tt_RMM_IOs[2][2];
     uint64_t tt_remaps[2];
     uint64_t tt_trims[2];
@@ -314,6 +332,17 @@ struct ssd {
 
     uint64_t wait_migrate_RMMs;
     uint64_t do_migrate_RMMs;
+
+    uint64_t tt_FP_IOs[2][2];
+    uint64_t valid_FPs;
+    uint64_t valid_FP_pages;
+    uint64_t g_malloc_FP_pages;
+    uint64_t g_free_FP_pages;
+
+    uint64_t FP_GC_luns[64];
+    uint64_t FP_mig_luns[64];
+    uint64_t FP_aloc_luns[64];
+    uint64_t data_GC_luns[64];
 
     uint64_t ptns[64];
 };
