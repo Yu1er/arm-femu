@@ -338,13 +338,6 @@ struct ssd {
     uint64_t valid_FP_pages;
     uint64_t g_malloc_FP_pages;
     uint64_t g_free_FP_pages;
-
-    uint64_t FP_GC_luns[64];
-    uint64_t FP_mig_luns[64];
-    uint64_t FP_aloc_luns[64];
-    uint64_t data_GC_luns[64];
-
-    uint64_t ptns[64];
 };
 
 extern uint16_t ssd_id_cnt;
