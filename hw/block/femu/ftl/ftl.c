@@ -6,9 +6,11 @@
 #include "ftl.h"
 #include <execinfo.h>
 #include "MD5.h"
+#include "btree.h"
 
 uint16_t ssd_count = 0;
 int ptn_num = 0;
+int collect_count = 0;
 
 static void *ftl_thread(void *arg);
 
@@ -34,6 +36,7 @@ void set_FP(struct ssd *ssd, struct ppa *ppa, uint8_t *FP, int ptn_id);
 void ssd_init_write_FP_pointer(struct ssd *ssd);
 void ssd_init_FP_page(struct ssd *ssd);
 void FP_migration(struct ssd *ssd, struct line *line, int ptn_id);
+int do_dedup(struct ssd *ssd, int ptn_id);
 
 /* 打印调用栈的最大深度 */
 #define DUMP_STACK_DEPTH_MAX 16
@@ -84,6 +87,11 @@ static inline bool should_gc(struct ssd *ssd, int ptn_id)
 static inline bool should_gc_high(struct ssd *ssd, int ptn_id)
 {
     return (ssd->lm[ptn_id].free_line_cnt < ssd->sp.gc_thres_lines_high);
+}
+
+static inline bool should_dedup(struct ssd *ssd, int ptn_id)
+{
+    return (ssd->write_after_dedup[ptn_id] >= ssd->sp.dedup_thres_writes);
 }
 
 inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn, bool if_remote_lpn)
@@ -352,7 +360,7 @@ static void ssd_init_params(struct ssdparams *spp)
     spp->tt_luns = spp->luns_per_ch * spp->nchs;
 
     /* 初始化分区参数 */
-    spp->luns_per_ptn = 64;  // 每个分区包含2个LUN，可配置
+    spp->luns_per_ptn = 8;  // 每个分区包含2个LUN，可配置
     spp->tt_ptns = spp->tt_luns / spp->luns_per_ptn;  // 总分区数
     
     /* 确保LUN数量能被分区大小整除 */
@@ -368,6 +376,9 @@ static void ssd_init_params(struct ssdparams *spp)
     spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);
     spp->gc_thres_pcent_high = 0.95;
     spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
+
+    spp->dedup_thres_pcent = 0.5;
+    spp->dedup_thres_writes = (int)(spp->dedup_thres_pcent * spp->pgs_per_lun * spp->luns_per_ptn);
 
     printf("spp->pgs_per_line: %d\n", spp->pgs_per_line);
     printf("spp->tt_lines: %d\n", spp->tt_lines);
@@ -512,6 +523,7 @@ void ssd_init(FemuCtrl *n)
     ssd_init_write_FP_pointer(ssd);
     ssd_init_FP_page(ssd);
     ptn_num = 0;
+    ssd->write_after_dedup = g_malloc0(sizeof(uint64_t) * ssd->sp.tt_ptns);
 
     // qemu_thread_create(&ssd->ftl_thread, "ftl_thread", ftl_thread, ssd,
     qemu_thread_create(&ssd->ftl_thread, "ftl_thread", ftl_thread, n,
@@ -1083,6 +1095,15 @@ static void *ftl_thread(void *arg)
                     do_gc(ssd, i, false);
                 }
             }
+            for(int i = 0;i < ssd->sp.tt_ptns;i++) {
+                if (should_dedup(ssd, i)) {
+                    ssd->dedup_ptn = i;
+                    ssd->dedup_cnt = 0;
+                    ssd->dedup_all = 0;
+                    do_dedup(ssd, i);
+                    ssd->write_after_dedup[i] = 0;
+                }
+            }
         }
     }
 }
@@ -1171,6 +1192,7 @@ uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
         getMd5(mb + data_offset, 16, req->FP);
         memcpy(&fp_value, req->FP, sizeof(uint64_t));
         ptn_id = fp_value % (uint64_t)spp->tt_ptns;
+        ssd->write_after_dedup[ptn_id]++;
 
         while (should_gc_high(ssd, ptn_id)) {
             /* perform GC here until !should_gc(ssd) */
@@ -1721,54 +1743,85 @@ inline void ssd_init_GC_migration_mappins(struct ssd *ssd)
     ssd->wait_migrate_RMMs = ssd->do_migrate_RMMs = 0;
 }
 
-//SSD-GC needs to read RMMs for updating P2L mappings, thus we firstly flush RMMs of line which won't be GC (has the most of valid pages)
-int do_NVRAM_gc(struct ssd *ssd)
+struct victim_select_result {
+    struct line *victim_line;
+    int victim_ptn;
+};
+
+static struct victim_select_result select_victim_segment(struct ssd *ssd, bool force)
 {
     struct segment_mgmt *sm = &ssd->segment_management;
-    struct line_mgmt *lm, *victim_lm = NULL;
-    struct line *line, *victim_line = NULL;
+    struct line_mgmt *lm;
     struct segment* segment;
-    int min_ipc = INT_MAX;
+    struct line *line, *victim_line = NULL, *victim_line_spare = NULL;
+    int victim_ptn = 0, victim_ptn_spare = 0;
+    int min_ipc = INT_MAX, min_ipc_spare = INT_MAX;
     for(int i=0; i<NVRAM_Segment_Count; i++) {
         segment = &sm->segments[i];
         if(segment->metadata.line_id != UNALLOCATED_SEGMENT) {
             my_assert(ssd, segment->metadata.line_id < ssd->sp.tt_lines, "Error: segment->metadata.line_id >= ssd->sp.tt_lines");
             lm = &ssd->lm[segment->metadata.ptn_id];
             line = &lm->lines[segment->metadata.line_id];
-            if (line->segment_count_inNVRAM >= Segment_Per_Page && line->ipc < min_ipc) {
-                victim_lm = lm;
-                victim_line = line;
-                min_ipc = line->ipc;
-            }
-        }
-    }
-    if(min_ipc == INT_MAX) {
-        for(int i=0; i<NVRAM_Segment_Count; i++) {
-            segment = &sm->segments[i];
-            if(segment->metadata.line_id != UNALLOCATED_SEGMENT) {
-                my_assert(ssd, segment->metadata.line_id < ssd->sp.tt_lines, "Error: segment->metadata.line_id >= ssd->sp.tt_lines");
-                lm = &ssd->lm[segment->metadata.ptn_id];
-                line = &lm->lines[segment->metadata.line_id];
-                if (line->segment_count_inNVRAM > 0) {
-                    victim_lm = lm;
-                    victim_line = line;
-                    break;
+            if (line->ipc < min_ipc) {
+                // 优先选中非当前正在重删的分区
+                if(force || segment->metadata.ptn_id != ssd->dedup_ptn){
+                    // 优先选中segment数量可以凑满一个page的line
+                    if(line->segment_count_inNVRAM >= Segment_Per_Page){
+                        victim_ptn = segment->metadata.ptn_id;
+                        victim_line = line;
+                        min_ipc = line->ipc;
+                    }
+                    // 为了避免没有满足上述条件的line, 备选有效页最多的line
+                    if(line->ipc < min_ipc_spare) {
+                        victim_ptn_spare = segment->metadata.ptn_id;
+                        victim_line_spare = line;
+                        min_ipc_spare = line->ipc;
+                    }
                 }
             }
         }
     }
-    assert(victim_lm != NULL);
+    if(min_ipc == INT_MAX) {
+        victim_line = victim_line_spare;
+        victim_ptn = victim_ptn_spare;
+    }
+    struct victim_select_result result = {
+        .victim_line = victim_line,
+        .victim_ptn = victim_ptn
+    };
+    
+    return result;
+}
+
+//SSD-GC needs to read RMMs for updating P2L mappings, thus we firstly flush RMMs of line which won't be GC (has the most of valid pages)
+int do_NVRAM_gc(struct ssd *ssd)
+{
+    struct victim_select_result result;
+    struct line *victim_line;
+    int victim_ptn;
+    
+    result = select_victim_segment(ssd, false);
+
+    if(result.victim_line == NULL) 
+        result = select_victim_segment(ssd, true);
+
+    victim_line = result.victim_line;
+    victim_ptn = result.victim_ptn;
+    
+
     assert(victim_line != NULL);
+    // my_log(ssd->fp_info, "do_NVRAM_gc: victim_ptn=%d, victim_line=%d, min_ipc=%d\n", victim_ptn, victim_line->id, min_ipc);
 
     int released_segment_count = 0;
-    struct RMM_page *RMM_page = get_RMM_page(ssd, segment->metadata.ptn_id);
+    struct RMM_page *RMM_page = get_RMM_page(ssd, victim_ptn);
+    struct segment* segment;
     QTAILQ_FOREACH(segment, &victim_line->segment_group_list, entry) {
         memcpy(&(RMM_page->segments[released_segment_count]), segment, sizeof(struct segment));
         if(++released_segment_count == Segment_Per_Page)
             break;
     }
     QTAILQ_INSERT_TAIL(&victim_line->RMM_page_list, RMM_page, entry);
-    flush_RMM_page(ssd, RMM_page, segment->metadata.ptn_id);
+    flush_RMM_page(ssd, RMM_page, victim_ptn);
 
     for(int i=released_segment_count; i>0; i--) {
         segment = QTAILQ_FIRST(&victim_line->segment_group_list);
@@ -2110,4 +2163,228 @@ void FP_migration(struct ssd *ssd, struct line *line, int ptn_id)
         ssd->valid_FP_pages--;
         ssd->g_free_FP_pages++;
     }
+}
+
+struct FPKV {
+    unsigned char key[FP_SIZE];
+    struct ppa ppa;
+};
+
+static int FP_compare(const void *a, const void *b, void *udata) {
+    const struct FPKV *FPa = a;
+    const struct FPKV *FPb = b;
+    return memcmp(FPa->key, FPb->key, FP_SIZE);
+}
+
+// 用于临时保存一个物理页的所有反向映射
+struct rmap_list {
+    uint64_t lpn;
+    struct rmap_list *next;
+};
+
+// 用于临时保存一个line的所有反向映射 
+struct line_rmap {
+    struct rmap_list **ppa_rmaps;  // 每个物理页对应一个反向映射链表
+    int ppa_count;                 // line中的物理页数量
+};
+
+// 将RMM添加到line_rmap中
+static void add_RMM_to_line_rmap(struct ssd *ssd, struct line_rmap *line_rmap, struct RMM *RMM, int line_id, int ptn_id) {
+    if(!is_valid_RMM(ssd, RMM, line_id, ptn_id))
+        return;
+
+    uint64_t page_offset = RMM->offset;
+    struct rmap_list *rmap = (struct rmap_list*)g_malloc0(sizeof(struct rmap_list)); 
+    rmap->lpn = RMM->target_LPN;
+    rmap->next = line_rmap->ppa_rmaps[page_offset];
+    line_rmap->ppa_rmaps[page_offset] = rmap;
+    collect_count++;
+}
+
+// 将ssd->rmap中的映射添加到line_rmap中
+static void add_rmap_to_line_rmap(struct ssd *ssd, struct line_rmap *line_rmap, struct ppa *ppa) {
+    struct rmap_elem elem = get_rmap_ent(ssd, ppa);
+    if(elem.lpn == INVALID_LPN || elem.lpn == RMM_PAGE || elem.lpn == FP_PAGE) {
+        return;
+    }
+    
+    uint64_t page_offset = ppa_to_OffsetInLine(ssd, ppa);
+    struct rmap_list *rmap = (struct rmap_list*)g_malloc0(sizeof(struct rmap_list));
+    rmap->lpn = elem.lpn;
+    rmap->next = line_rmap->ppa_rmaps[page_offset];
+    line_rmap->ppa_rmaps[page_offset] = rmap;
+    collect_count++;
+}
+
+// 释放line_rmap资源
+static void free_line_rmap(struct line_rmap *line_rmap) {
+    for(int i = 0; i < line_rmap->ppa_count; i++) {
+        struct rmap_list *rmap = line_rmap->ppa_rmaps[i];
+        while(rmap) {
+            struct rmap_list *next = rmap->next;
+            g_free(rmap);
+            rmap = next;
+        }
+    }
+    g_free(line_rmap->ppa_rmaps);
+    g_free(line_rmap);
+}
+
+// 读取并添加一个line中所有的反向映射到line_rmap
+static void collect_line_rmaps(struct ssd *ssd, struct line *line, struct line_rmap *line_rmap, int ptn_id) {
+    struct ssdparams *spp = &ssd->sp;
+    // 1. 读取并添加ssd->rmap中的反向映射
+    for(int offset = 0; offset < spp->pgs_per_line; offset++) {
+        struct ppa ppa = OffsetInLine_to_ppa(ssd, offset, line->id, ptn_id); 
+        add_rmap_to_line_rmap(ssd, line_rmap, &ppa);
+    }
+    // 2. 读取并恢复NVRAM中的反向映射
+    struct segment *segment;
+    QTAILQ_FOREACH(segment, &line->segment_group_list, entry) {
+        my_assert(ssd, segment->metadata.line_id == line->id,
+            "error in do_dedup, segment_line:%d, dedup_line:%d\n",
+            segment->metadata.line_id, line->id);
+        
+        struct nand_cmd nvrd;
+        nvrd.stime = 0;
+        nvrd.cmd = NVRAM_READ;
+        nvram_advance_status(ssd, &nvrd, RMMs_Per_Segment);
+
+        // 处理segment中的每个RMM
+        for(int i = 0; i < segment->metadata.RMM_number; i++) {
+            add_RMM_to_line_rmap(ssd, line_rmap, &segment->RMMs[i], line->id, ptn_id);
+        }
+    }
+    // 3. 读取并恢复RMM_Page中的反向映射  
+    struct RMM_page *RMM_page;
+    QTAILQ_FOREACH(RMM_page, &line->RMM_page_list, entry) {
+        read_RMM_page(ssd, &RMM_page->ppa);
+        
+        for(int i = 0; i < Segment_Per_Page; i++) {
+            struct segment *segment = &RMM_page->segments[i];
+            for(int j = 0; j < segment->metadata.RMM_number; j++) {
+                add_RMM_to_line_rmap(ssd, line_rmap, &segment->RMMs[j], line->id, ptn_id);
+            }
+        }
+    }
+}
+
+// 处理指纹页找到重复页后的重定向操作
+static void handle_duplicate_page(struct ssd *ssd, struct ppa *exist_ppa, struct ppa *old_ppa, struct rmap_list *rmap_head) {
+    struct rmap_list *rmap = rmap_head;
+    while(rmap) {
+        struct rmap_elem elem;
+        elem.lpn = rmap->lpn;
+        elem.RMM_page_p = NULL;
+        elem.FP_page_p = NULL;
+
+        my_assert(ssd, old_ppa->ppa == get_maptbl_ent(ssd, elem.lpn, false).ppa, 
+            "Error: old_ppa != get_maptbl_ent(ssd, elem.lpn, false).ppa in handle_duplicate_page\n");
+        // if (mapped_ppa(old_ppa)) {
+        delete_reference(ssd, false, old_ppa, elem);
+        // }
+        add_reference(ssd, false, exist_ppa, false, elem);
+
+        // 为重定向添加新的RMM
+        int global_lun_id = exist_ppa->g.ch * ssd->sp.luns_per_ch + exist_ppa->g.lun;
+        int ptn_id = global_lun_id / ssd->sp.luns_per_ptn;
+        struct RMM *new_RMM = get_RMM(ssd, get_line(ssd, exist_ppa), ptn_id);
+        new_RMM->torn_bit_0 = 1;
+        new_RMM->offset = ppa_to_OffsetInLine(ssd, exist_ppa);
+        new_RMM->number = ssd->cur_write_number++;
+        new_RMM->torn_bit_1 = 1;
+        new_RMM->if_remote_lpn = false;  
+        new_RMM->target_LPN = rmap->lpn;
+        my_assert(ssd, is_valid_RMM(ssd, new_RMM, get_line(ssd, exist_ppa)->id, ptn_id), "Error: it is an invalid RMM when handle_duplicate_page");
+
+        struct nand_cmd nvwr;
+        nvwr.stime = 0;
+        nvwr.cmd = NVRAM_WRITE;
+        nvram_advance_status(ssd, &nvwr, 1);
+
+        rmap = rmap->next;
+    }
+    struct nand_page *pg = get_pg(ssd, old_ppa);
+    my_assert(ssd, pg->refcount == 0, "Error: pg->refcount != 0");
+}
+
+// 对一个line进行去重处理 
+static void dedup_line(struct ssd *ssd, struct line *line, int ptn_id, struct btree *FP_tree) {
+    struct ssdparams *spp = &ssd->sp;
+
+    if(line->is_RMM_line || line->is_FP_line) {
+        return;
+    }
+    // 初始化line_rmap
+    struct line_rmap *line_rmap = (struct line_rmap*)g_malloc0(sizeof(struct line_rmap));
+    line_rmap->ppa_count = spp->pgs_per_line;
+    line_rmap->ppa_rmaps = (struct rmap_list**)g_malloc0(line_rmap->ppa_count * sizeof(struct rmap_list*));
+    
+    // 收集该line所有的反向映射
+    collect_line_rmaps(ssd, line, line_rmap, ptn_id);
+
+    // 读取指纹页并进行去重处理
+    struct FP_page *FP_page;
+    int FP_page_idx = 0;
+    QTAILQ_FOREACH(FP_page, &line->FP_page_list, entry) {
+        read_FP_page(ssd, &FP_page->ppa);
+
+        // 处理每个指纹条目
+        for(int i = 0; i < FPs_Per_Page; i++) {
+            // 计算该指纹对应的物理页
+            int page_offset = FP_page_idx * FPs_Per_Page + i;
+            struct ppa ppa = OffsetInLine_to_ppa(ssd, page_offset, line->id, ptn_id);
+            struct nand_page *pg = get_pg(ssd, &ppa);
+            // 跳过无效页
+            if(pg->status != PG_VALID || pg->refcount == 0) {
+                continue;
+            }
+
+            struct FPKV FP_kv;
+            memcpy(FP_kv.key, FP_page->FP_entrys[i].FP, FP_SIZE);
+            my_assert(ssd, FP_kv.key != NULL, "Error: FP_kv.key is NULL");
+            
+            // 在B树中查找是否存在相同指纹
+            const struct FPKV *exist_kv = btree_get(FP_tree, &FP_kv);
+            if(exist_kv == NULL) {
+                // 未找到重复,加入B树
+                FP_kv.ppa = ppa;
+                btree_set(FP_tree, &FP_kv);
+            } else {
+                // 找到重复,处理重定向
+                handle_duplicate_page(ssd, &exist_kv->ppa, &ppa, line_rmap->ppa_rmaps[page_offset]);
+                ssd->dedup_cnt++;
+            }
+            ssd->dedup_all++;
+        }
+        FP_page_idx++;
+    }
+    // 释放line_rmap
+    free_line_rmap(line_rmap);
+}
+
+int do_dedup(struct ssd *ssd, int ptn_id)
+{
+    struct btree *FP_tree = btree_new(sizeof(struct FPKV), 0, FP_compare, NULL);
+    if (!FP_tree) {
+        return -1;
+    }
+    my_log(ssd->fp_info, "ptn %d start dedup\n", ptn_id);
+
+    struct line_mgmt *lm = &ssd->lm[ptn_id];
+    struct line *line = NULL;
+
+    // 对victim_line进行去重
+    QTAILQ_FOREACH(line, &lm->victim_line_list, entry) {
+        dedup_line(ssd, line, ptn_id, FP_tree); 
+    }
+
+    // 对full_line进行去重 
+    QTAILQ_FOREACH(line, &lm->full_line_list, entry) {
+        dedup_line(ssd, line, ptn_id, FP_tree);
+    }
+    my_log(ssd->fp_info, "collect %d rmaps in ptn %d, all data %d, dedup %d\n", collect_count, ptn_id, ssd->dedup_all, ssd->dedup_cnt);
+    collect_count = 0;
+    btree_free(FP_tree);
+    return 0;
 }

@@ -228,6 +228,9 @@ struct ssdparams {
 
     int luns_per_ptn;         /* # of LUNs in one partition */
     int tt_ptns;              /* # of partitions in the SSD */
+
+    double dedup_thres_pcent;
+    int dedup_thres_writes;
 };
 
 typedef struct line {
@@ -338,6 +341,11 @@ struct ssd {
     uint64_t valid_FP_pages;
     uint64_t g_malloc_FP_pages;
     uint64_t g_free_FP_pages;
+
+    uint64_t *write_after_dedup;//每个分区自上次重删后的写次数
+    int dedup_ptn; //当前正在处理的重删分区号
+    int dedup_cnt; //本次重删删去的重复数据数量
+    int dedup_all; //本次重删总共处理的数据数量
 };
 
 extern uint16_t ssd_id_cnt;
