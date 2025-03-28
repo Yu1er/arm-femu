@@ -89,6 +89,15 @@ static inline bool should_gc_high(struct ssd *ssd, int ptn_id)
     return (ssd->lm[ptn_id].free_line_cnt < ssd->sp.gc_thres_lines_high);
 }
 
+static inline bool should_gc_all(struct ssd *ssd)
+{
+    int free_line_cnt = 0;
+    for(int ptn = 0; ptn < ssd->sp.tt_ptns; ptn++) {
+        free_line_cnt += ssd->lm[ptn].free_line_cnt;
+    }
+    return (free_line_cnt <= ssd->sp.gc_thres_lines * ssd->sp.tt_ptns);
+}
+
 static inline bool should_dedup(struct ssd *ssd, int ptn_id)
 {
     return (ssd->write_after_dedup[ptn_id] >= ssd->sp.dedup_thres_writes);
@@ -1090,8 +1099,13 @@ static void *ftl_thread(void *arg)
         /* clean one line if needed (in the background) */
         if(req->opcode == NVME_CMD_WRITE) {
             // int ptn_id = (ptn_num + ssd->sp.tt_ptns - 1) % ssd->sp.tt_ptns;
-            for(int i = 0;i < ssd->sp.tt_ptns;i++) {
-                if (should_gc(ssd, i)) {
+            // for(int i = 0;i < ssd->sp.tt_ptns;i++) {
+            //     if (should_gc(ssd, i)) {
+            //         do_gc(ssd, i, false);
+            //     }
+            // }
+            if(should_gc_all(ssd)) {
+                for(int i = 0;i < ssd->sp.tt_ptns;i++) {
                     do_gc(ssd, i, false);
                 }
             }
@@ -1196,7 +1210,7 @@ uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
 
         while (should_gc_high(ssd, ptn_id)) {
             /* perform GC here until !should_gc(ssd) */
-            //printf("FEMU: FTL doing blocking GC\n");
+            printf("FEMU: FTL doing blocking GC\n");
             r = do_gc(ssd, ptn_id, true);
             if (r == -1)
                 break;
@@ -1887,6 +1901,10 @@ void RMM_migration(struct ssd *ssd, struct RMM *RMM, int line_id, int ptn_id)
         ssd->GC_migration_mappings[RMM->offset] = new_ppa;
         add_reference(ssd, RMM->if_remote_lpn, &new_ppa, false, elem);
         ssd_advance_write_pointer(ssd, ptn_id, false, false);
+        // 立即检查映射表是否更新成功
+        struct ppa check_ppa = get_maptbl_ent(ssd, RMM->target_LPN, RMM->if_remote_lpn);
+        my_assert(ssd, mapped_ppa(&check_ppa), "映射表未正确更新");
+        my_assert(ssd, check_ppa.ppa == new_ppa.ppa, "映射表中的PPA与预期不符");
 
         ssd->tt_GC_IOs[TOTAL][NAND_WRITE]++;
         ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE]++;
@@ -1897,6 +1915,10 @@ void RMM_migration(struct ssd *ssd, struct RMM *RMM, int line_id, int ptn_id)
     }
     else{
         add_reference(ssd, RMM->if_remote_lpn, &new_ppa, false, elem);
+        // 立即检查映射表是否更新成功
+        struct ppa check_ppa = get_maptbl_ent(ssd, RMM->target_LPN, RMM->if_remote_lpn);
+        my_assert(ssd, mapped_ppa(&check_ppa), "映射表未正确更新");
+        my_assert(ssd, check_ppa.ppa == new_ppa.ppa, "映射表中的PPA与预期不符");
     }
 
     /* update rmap of target_lpn in RMMs */
