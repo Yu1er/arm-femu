@@ -246,6 +246,8 @@ typedef struct line {
     QTAILQ_HEAD(FP_page_list, FP_page) FP_page_list;      //stored in flash
     bool is_FP_line;
     int segment_count_inNVRAM;
+    bool dedup_processed;    // 标记该line是否已在本次重删中处理
+    bool dedup_in_process;   // 标记该line是否正在被重删处理
 } line;
 
 /* wp: record next write addr */
@@ -281,6 +283,35 @@ struct rmap_elem {
     struct FP_page* FP_page_p;
 };
 
+struct FPKV {
+    unsigned char key[FP_SIZE];
+    struct ppa ppa;
+};
+
+// 用于临时保存一个物理页的所有反向映射
+struct rmap_list {
+    uint64_t lpn;
+    struct rmap_list *next;
+};
+
+// 用于临时保存一个line的所有反向映射 
+struct line_rmap {
+    struct rmap_list **ppa_rmaps;  // 每个物理页对应一个反向映射链表
+    int ppa_count;                 // line中的物理页数量
+};
+
+struct dedup_ctx{
+    bool dedup_in_progress;          // 是否正在进行重删
+    int current_ptn;                 // 当前正在重删的分区
+    struct line *current_line;       // 当前正在处理的line
+    struct btree *fp_tree;           // 复用的指纹树
+    int processed_pages;             // 当前line已处理的页数
+    struct FP_page *current_fp_page; // 当前正在处理的指纹页
+    int current_fp_page_idx;         // 当前处理的指纹页的位置
+    int current_fp_idx;              // 当前指纹页处理到的位置
+    struct line_rmap *line_rmap;     // 当前line的反向映射缓存
+};
+
 struct ssd {
     char *ssdname;
     struct ssdparams sp;
@@ -291,6 +322,7 @@ struct ssd {
     struct line_mgmt *lm;
     uint16_t id; /* unique id for synchronization */
     uint64_t next_ssd_avail_time;
+    uint64_t min_lun_avail_time;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring *to_ftl;
@@ -346,6 +378,11 @@ struct ssd {
     int dedup_ptn; //当前正在处理的重删分区号
     int dedup_cnt; //本次重删删去的重复数据数量
     int dedup_all; //本次重删总共处理的数据数量
+
+    uint64_t ptns[64];  //记录每个分区的写次数
+
+    struct dedup_ctx dedup_ctx; //重删上下文
+    int next_dedup_ptn; //上次重删的分区号
 };
 
 extern uint16_t ssd_id_cnt;

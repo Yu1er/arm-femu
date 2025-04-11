@@ -37,6 +37,7 @@ void ssd_init_write_FP_pointer(struct ssd *ssd);
 void ssd_init_FP_page(struct ssd *ssd);
 void FP_migration(struct ssd *ssd, struct line *line, int ptn_id);
 int do_dedup(struct ssd *ssd, int ptn_id);
+int do_dedup_partial(struct ssd *ssd);
 
 /* 打印调用栈的最大深度 */
 #define DUMP_STACK_DEPTH_MAX 16
@@ -177,6 +178,8 @@ static void ssd_init_lines(struct ssd *ssd)
             line->id = i;
             line->ipc = 0;
             line->vpc = 0;
+            line->dedup_processed = false;
+            line->dedup_in_process = false;
             /* initialize all the lines as free lines */
             QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
             lm->free_line_cnt++;
@@ -501,6 +504,7 @@ void ssd_init(FemuCtrl *n)
     ssd->id = ssd_count++;
     printf("GCSYNC SSD initialized with id %d\n", ssd->id);
 	ssd->next_ssd_avail_time = 0;
+    ssd->min_lun_avail_time = 0;
     ssd->last_print_time_s = 0;
     ssd->test_begin = true;
 
@@ -533,6 +537,7 @@ void ssd_init(FemuCtrl *n)
     ssd_init_FP_page(ssd);
     ptn_num = 0;
     ssd->write_after_dedup = g_malloc0(sizeof(uint64_t) * ssd->sp.tt_ptns);
+    ssd->next_dedup_ptn = 0;
 
     // qemu_thread_create(&ssd->ftl_thread, "ftl_thread", ftl_thread, ssd,
     qemu_thread_create(&ssd->ftl_thread, "ftl_thread", ftl_thread, n,
@@ -659,6 +664,15 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa,
 	if (lun->next_lun_avail_time > ssd->next_ssd_avail_time) {
 		ssd->next_ssd_avail_time = lun->next_lun_avail_time;
 	}
+    uint64_t min_time = lun->next_lun_avail_time;
+    for(int chp = 0; chp < ssd->sp.nchs; chp++) {
+        struct ssd_channel *ch = &ssd->ch[chp];
+        for(int lunp = 0; lunp < ssd->sp.luns_per_ch; lunp++) {
+            struct nand_lun *l = &ch->lun[lunp];
+            min_time = min_time < l->next_lun_avail_time ? min_time : l->next_lun_avail_time;
+        }
+    }
+    ssd->min_lun_avail_time = min_time;
 
     printf_info(ssd, false);
 
@@ -889,13 +903,19 @@ static struct line *select_victim_line(struct ssd *ssd, int ptn_id, bool force)
 
     QTAILQ_FOREACH(line, &lm->victim_line_list, entry) {
         //printf("Coperd,%s,victim_line_list[%d],ipc=%d,vpc=%d\n", __func__, ++cnt, line->ipc, line->vpc);
+        // if (ssd->dedup_ctx.dedup_in_progress && (line->dedup_processed || line->dedup_in_process)) 
+        //     continue;
+        if (ssd->dedup_ctx.dedup_in_progress && line->dedup_in_process)
+            continue;
+        
         if (line->ipc > max_ipc) {
             victim_line = line;
             max_ipc = line->ipc;
         }
     }
-
+    // if(!ssd->dedup_ctx.dedup_in_progress) {
     my_assert(ssd, max_ipc > 0, "Error: there is no invalid page in all flash blocks");
+    // }
     if(!victim_line)
         return NULL;
 
@@ -962,6 +982,8 @@ static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
     line->next_segment_id = 0;
     line->is_RMM_line = false;
     line->is_FP_line = false;
+    line->dedup_processed = false;
+    line->dedup_in_process = false;
     /* move this line to free line list */
     QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
     lm->free_line_cnt++;
@@ -1098,24 +1120,34 @@ static void *ftl_thread(void *arg)
 
         /* clean one line if needed (in the background) */
         if(req->opcode == NVME_CMD_WRITE) {
-            // int ptn_id = (ptn_num + ssd->sp.tt_ptns - 1) % ssd->sp.tt_ptns;
-            // for(int i = 0;i < ssd->sp.tt_ptns;i++) {
-            //     if (should_gc(ssd, i)) {
-            //         do_gc(ssd, i, false);
-            //     }
-            // }
             if(should_gc_all(ssd)) {
                 for(int i = 0;i < ssd->sp.tt_ptns;i++) {
                     do_gc(ssd, i, false);
                 }
             }
-            for(int i = 0;i < ssd->sp.tt_ptns;i++) {
-                if (should_dedup(ssd, i)) {
-                    ssd->dedup_ptn = i;
-                    ssd->dedup_cnt = 0;
-                    ssd->dedup_all = 0;
-                    do_dedup(ssd, i);
-                    ssd->write_after_dedup[i] = 0;
+        }
+        uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if (now < ssd->min_lun_avail_time) {
+            // 如果正在进行重删,继续处理
+            if (ssd->dedup_ctx.dedup_in_progress) {
+                do_dedup_partial(ssd);
+            } 
+            // 否则检查是否需要启动新的重删
+            else {
+                int dedup_ptn = ssd->next_dedup_ptn;
+                while(1){
+                    if (should_dedup(ssd, dedup_ptn)) {
+                        ssd->dedup_ptn = dedup_ptn;
+                        ssd->dedup_cnt = 0;
+                        ssd->dedup_all = 0;
+                        ssd->next_dedup_ptn = (dedup_ptn + 1) % ssd->sp.tt_ptns;
+                        do_dedup_partial(ssd);
+                        break;
+                    }
+                    dedup_ptn = (dedup_ptn + 1) % ssd->sp.tt_ptns;
+                    if(dedup_ptn == ssd->next_dedup_ptn) {
+                        break;
+                    }
                 }
             }
         }
@@ -1207,6 +1239,7 @@ uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
         memcpy(&fp_value, req->FP, sizeof(uint64_t));
         ptn_id = fp_value % (uint64_t)spp->tt_ptns;
         ssd->write_after_dedup[ptn_id]++;
+        ssd->ptns[ptn_id]++;
 
         while (should_gc_high(ssd, ptn_id)) {
             /* perform GC here until !should_gc(ssd) */
@@ -1227,6 +1260,34 @@ uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
             /* update old page information first */
             //printf("Coperd,before-overwrite,line[%d],ipc=%d,vpc=%d\n", ppa.g.blk, get_line(ssd, &ppa)->ipc, get_line(ssd, &ppa)->vpc);
             delete_reference(ssd, false, &ppa, elem);
+
+            /* 检查被覆盖的页是否属于当前正在重删的line */
+            struct line *line = get_line(ssd, &ppa);
+            if (ssd->dedup_ctx.dedup_in_progress && 
+                line->dedup_in_process && 
+                ssd->dedup_ctx.current_line == line && 
+                ssd->dedup_ctx.line_rmap != NULL) {
+
+                uint64_t page_offset = ppa_to_OffsetInLine(ssd, &ppa);
+                struct rmap_list **rmap_ptr = &ssd->dedup_ctx.line_rmap->ppa_rmaps[page_offset];
+                struct rmap_list *rmap = *rmap_ptr;
+                struct rmap_list *prev = NULL;
+                
+                /* 遍历链表，找到并移除匹配的LPN */
+                while (rmap) {
+                    if (rmap->lpn == lpn) {
+                        if (prev) {
+                            prev->next = rmap->next;
+                        } else {
+                            *rmap_ptr = rmap->next;
+                        }
+                        g_free(rmap);
+                        break;
+                    }
+                    prev = rmap;
+                    rmap = rmap->next;
+                }
+            }
         }
 
         /* new write */
@@ -1498,6 +1559,11 @@ inline void printf_info(struct ssd *ssd, bool force_print)
             ssd->g_malloc_RMM_pages, ssd->g_free_RMM_pages,
             ssd->g_malloc_FP_pages, ssd->g_free_FP_pages,
             ssd->cpu_cycle_tt);
+
+        // for(int i=0;i<ssd->sp.tt_ptns;i++) {
+        //     my_log(ssd->fp_info, "ptn_%d = %d, ", i, ssd->ptns[i]);
+        // }
+        // my_log(ssd->fp_info, "\n");
 
         ssd->tt_IOs[LAST_SECOND][NAND_READ][USER_IO] = ssd->tt_IOs[LAST_SECOND][NAND_WRITE][USER_IO] = ssd->tt_IOs[LAST_SECOND][NAND_READ][METADATA_IO] = ssd->tt_IOs[LAST_SECOND][NAND_WRITE][METADATA_IO] = 0;
         ssd->tt_GC_IOs[LAST_SECOND][NAND_READ] = ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE] = ssd->tt_GC_IOs[LAST_SECOND][NAND_ERASE] = ssd->tt_GC_IOs[LAST_SECOND][3] = ssd->tt_GC_IOs[LAST_SECOND][4] = 0;
@@ -1930,7 +1996,7 @@ void RMM_migration(struct ssd *ssd, struct RMM *RMM, int line_id, int ptn_id)
     new_RMM->number = ssd->cur_write_number++;
     new_RMM->torn_bit_1 = 1;
     new_RMM->if_remote_lpn = RMM->if_remote_lpn;
-    new_RMM->target_LPN = RMM->target_LPN;
+    new_RMM->target_LPN = elem.lpn;
     my_assert(ssd, is_valid_RMM(ssd, new_RMM, get_line(ssd, &new_ppa)->id, ptn_id), "Error: it is an invalid RMM");
     ssd->do_migrate_RMMs++;
 
@@ -2125,7 +2191,7 @@ void ssd_init_FP_page(struct ssd *ssd)
 void FP_migration(struct ssd *ssd, struct line *line, int ptn_id)
 {
     struct FP_page *old_FP_page, *new_FP_page;
-    if(line->is_FP_line)
+    if(line->is_FP_line || line->is_RMM_line)
         return;
 
     QTAILQ_FOREACH(old_FP_page, &line->FP_page_list, entry) {
@@ -2135,10 +2201,6 @@ void FP_migration(struct ssd *ssd, struct line *line, int ptn_id)
     for(int offset = 0; offset < ssd->sp.pgs_per_line; offset++) {
         struct ppa old_ppa = OffsetInLine_to_ppa(ssd, offset, line->id, ptn_id);
         struct ppa new_ppa = ssd->GC_migration_mappings[offset];
-        if(new_ppa.ppa == UNMAPPED_PPA) {
-            ssd->valid_FPs--;
-            continue;
-        }
         // 计算指纹在old_line指纹页中的位置
         int old_FP_page_idx, old_FP_entry_idx;
         get_FP_location(ssd, offset, &old_FP_page_idx, &old_FP_entry_idx);
@@ -2149,6 +2211,24 @@ void FP_migration(struct ssd *ssd, struct line *line, int ptn_id)
             old_FP_page = QTAILQ_NEXT(old_FP_page, entry);
         }
 
+        if(line->dedup_processed){
+            struct FPKV *FP_kv_old, FP_kv_find;
+            if(new_ppa.ppa == UNMAPPED_PPA){
+                memcpy(FP_kv_find.key, old_FP_page->FP_entrys[old_FP_entry_idx].FP, FP_SIZE);
+                FP_kv_old = btree_get(ssd->dedup_ctx.fp_tree, &FP_kv_find);//page可能在重删前就已经成为无效页,所以指纹索引中可能不存在该page的指纹
+                if(FP_kv_old && FP_kv_old->ppa.ppa == old_ppa.ppa)
+                    FP_kv_old = btree_delete(ssd->dedup_ctx.fp_tree, old_FP_page->FP_entrys[old_FP_entry_idx].FP);
+            }
+            else{
+                FP_kv_old = btree_delete(ssd->dedup_ctx.fp_tree, old_FP_page->FP_entrys[old_FP_entry_idx].FP);
+                my_assert(ssd, FP_kv_old->ppa.ppa == old_ppa.ppa, "Error: FP_kv_old->ppa != old_ppa in FP_migration");
+            }
+        }
+
+        if(new_ppa.ppa == UNMAPPED_PPA) {
+            ssd->valid_FPs--;
+            continue;
+        }
         // 获取new_line
         struct line *new_line = get_line(ssd, &new_ppa);
         int new_offset = ppa_to_OffsetInLine(ssd, &new_ppa);
@@ -2187,28 +2267,11 @@ void FP_migration(struct ssd *ssd, struct line *line, int ptn_id)
     }
 }
 
-struct FPKV {
-    unsigned char key[FP_SIZE];
-    struct ppa ppa;
-};
-
 static int FP_compare(const void *a, const void *b, void *udata) {
     const struct FPKV *FPa = a;
     const struct FPKV *FPb = b;
     return memcmp(FPa->key, FPb->key, FP_SIZE);
 }
-
-// 用于临时保存一个物理页的所有反向映射
-struct rmap_list {
-    uint64_t lpn;
-    struct rmap_list *next;
-};
-
-// 用于临时保存一个line的所有反向映射 
-struct line_rmap {
-    struct rmap_list **ppa_rmaps;  // 每个物理页对应一个反向映射链表
-    int ppa_count;                 // line中的物理页数量
-};
 
 // 将RMM添加到line_rmap中
 static void add_RMM_to_line_rmap(struct ssd *ssd, struct line_rmap *line_rmap, struct RMM *RMM, int line_id, int ptn_id) {
@@ -2409,4 +2472,216 @@ int do_dedup(struct ssd *ssd, int ptn_id)
     collect_count = 0;
     btree_free(FP_tree);
     return 0;
+}
+
+// 查找下一个需要处理的line
+static struct line *find_next_line_to_dedup(struct ssd *ssd, int ptn_id)
+{
+    struct line_mgmt *lm = &ssd->lm[ptn_id];
+    struct line *line, *selected_line = NULL;
+    int min_ipc = INT_MAX;
+    
+    // 优先处理full_line
+    QTAILQ_FOREACH(line, &lm->full_line_list, entry) {
+        if (!line->dedup_processed && !line->dedup_in_process && !line->is_RMM_line && !line->is_FP_line) {
+            return line;
+        }
+    }
+    
+    // 再处理victim_line
+    QTAILQ_FOREACH(line, &lm->victim_line_list, entry) {
+        if (!line->dedup_processed && !line->dedup_in_process && !line->is_RMM_line && !line->is_FP_line) {
+            if(line->ipc < min_ipc) {
+                min_ipc = line->ipc;
+                selected_line = line; 
+            }
+        }
+    }
+    if (selected_line) 
+        return selected_line;
+    
+    // 检查是否所有line都已处理完
+    bool all_processed = true;
+    for (int i = 0; i < lm->tt_lines; i++) {
+        struct line *line = &lm->lines[i];
+        // 只检查full_line和victim_line
+        if ((QTAILQ_IN_USE(line, entry) && 
+             (line->vpc == ssd->sp.pgs_per_line || line->ipc > 0)) && 
+            (!line->dedup_processed && !line->is_RMM_line && !line->is_FP_line)) {
+            all_processed = false;
+            break;
+        }
+    }
+    
+    if (all_processed) {
+        my_log(ssd->fp_info, "All lines in partition %d have been processed\n", ptn_id);
+        return NULL;
+    }
+    
+    return NULL;
+}
+
+// 返回值: 
+// >0 表示本次处理的页数
+// 0  表示当前line处理完成
+// -1 表示分区重删完成
+int do_dedup_partial(struct ssd *ssd)
+{
+    struct dedup_ctx *ctx = &ssd->dedup_ctx;
+    int processed = 0;
+    uint64_t now;
+    
+    if (!ctx->dedup_in_progress) {
+        // 初始化新的重删任务
+        ctx->dedup_in_progress = true;
+        ctx->current_ptn = ssd->dedup_ptn;
+        ctx->fp_tree = btree_new(sizeof(struct FPKV), 0, FP_compare, NULL);
+        if (!ctx->fp_tree) {
+            ctx->dedup_in_progress = false;
+            return -1;
+        }
+
+        // 初始化所有line的处理标记
+        struct line_mgmt *lm = &ssd->lm[ctx->current_ptn];
+        for (int i = 0; i < lm->tt_lines; i++) {
+            lm->lines[i].dedup_processed = false;
+            lm->lines[i].dedup_in_process = false;
+        }
+        
+        ctx->current_line = find_next_line_to_dedup(ssd, ctx->current_ptn);
+        if (!ctx->current_line) {
+            btree_free(ctx->fp_tree);
+            ctx->dedup_in_progress = false;
+            return -1;
+        }
+        
+        // 初始化line处理状态
+        ctx->processed_pages = 0;
+        ctx->current_fp_page = QTAILQ_FIRST(&ctx->current_line->FP_page_list);
+        ctx->current_fp_page_idx = 0;
+        ctx->current_fp_idx = 0;
+        read_FP_page(ssd, &ctx->current_fp_page->ppa);
+        // 初始化line_rmap
+        ctx->line_rmap = (struct line_rmap*)g_malloc0(sizeof(struct line_rmap));
+        ctx->line_rmap->ppa_count = ssd->sp.pgs_per_line;
+        ctx->line_rmap->ppa_rmaps = (struct rmap_list**)g_malloc0(ctx->line_rmap->ppa_count * sizeof(struct rmap_list*));
+        
+        collect_line_rmaps(ssd, ctx->current_line, ctx->line_rmap, ctx->current_ptn);
+        if (!ctx->line_rmap) {
+            btree_free(ctx->fp_tree);
+            ctx->dedup_in_progress = false;
+            return -1;
+        }
+        
+        // 设置正在处理标记
+        ctx->current_line->dedup_in_process = true;
+        
+        my_log(ssd->fp_info, "Start dedup for partition %d\n", ctx->current_ptn);
+    }
+
+    while (1) {
+        now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if (now >= ssd->min_lun_avail_time) {
+            return processed;
+        }
+
+        if (!ctx->current_fp_page) {
+            // 当前line处理完成
+            ctx->current_line->dedup_in_process = false;
+            ctx->current_line->dedup_processed = true;
+            free_line_rmap(ctx->line_rmap);
+            ctx->line_rmap = NULL;
+            
+            // 获取下一个line
+            ctx->current_line = find_next_line_to_dedup(ssd, ctx->current_ptn);
+            if (!ctx->current_line) {
+                goto dedup_complete;
+            }
+            
+            // 初始化新line
+            ctx->processed_pages = 0;
+            ctx->current_fp_page = QTAILQ_FIRST(&ctx->current_line->FP_page_list);
+            ctx->current_fp_page_idx = 0;
+            ctx->current_fp_idx = 0;
+            read_FP_page(ssd, &ctx->current_fp_page->ppa);
+            // 初始化line_rmap
+            ctx->line_rmap = (struct line_rmap*)g_malloc0(sizeof(struct line_rmap));
+            ctx->line_rmap->ppa_count = ssd->sp.pgs_per_line;
+            ctx->line_rmap->ppa_rmaps = (struct rmap_list**)g_malloc0(ctx->line_rmap->ppa_count * sizeof(struct rmap_list*));
+            
+            collect_line_rmaps(ssd, ctx->current_line, ctx->line_rmap, ctx->current_ptn);
+            if (!ctx->line_rmap) {
+                goto dedup_complete;
+            }
+            
+            // 设置新line的处理标记
+            ctx->current_line->dedup_in_process = true;
+            continue;
+        }
+
+        // 处理当前指纹页中的一个条目
+        int page_offset = ctx->current_fp_page_idx * FPs_Per_Page + ctx->current_fp_idx;
+        struct ppa ppa = OffsetInLine_to_ppa(ssd, page_offset, 
+                                           ctx->current_line->id, ctx->current_ptn);
+        
+        if (get_pg(ssd, &ppa)->status == PG_VALID) {
+            struct FPKV fp_kv;
+            memcpy(fp_kv.key, ctx->current_fp_page->FP_entrys[ctx->current_fp_idx].FP, FP_SIZE);
+            
+            const struct FPKV *exist_kv = btree_get(ctx->fp_tree, &fp_kv);
+            if (!exist_kv) {
+                fp_kv.ppa = ppa;
+                btree_set(ctx->fp_tree, &fp_kv);
+            } else {
+                if(get_pg(ssd, &exist_kv->ppa)->status == PG_INVALID){
+                    fp_kv.ppa = ppa;
+                    btree_set(ctx->fp_tree, &fp_kv);
+                }
+                else 
+                    handle_duplicate_page(ssd, &exist_kv->ppa, &ppa, ctx->line_rmap->ppa_rmaps[page_offset]);
+                ssd->dedup_cnt++;
+            }
+            ssd->dedup_all++;
+            processed++;
+        }
+
+        // 移动到下一个条目
+        ctx->current_fp_idx++;
+        if (ctx->current_fp_idx >= FPs_Per_Page) {
+            ctx->current_fp_page = QTAILQ_NEXT(ctx->current_fp_page, entry);
+            ctx->current_fp_page_idx++;
+            ctx->current_fp_idx = 0;
+            if(ctx->current_fp_page) {
+                read_FP_page(ssd, &ctx->current_fp_page->ppa);
+            }
+        }
+    }
+
+dedup_complete:
+    // 清理重删上下文
+    btree_free(ctx->fp_tree);
+    if (ctx->line_rmap) {
+        free_line_rmap(ctx->line_rmap);
+        ctx->line_rmap = NULL;
+    }
+    
+    // 清除所有line的处理标记
+    struct line_mgmt *lm = &ssd->lm[ctx->current_ptn];
+    struct line *line;
+    QTAILQ_FOREACH(line, &lm->full_line_list, entry) {
+        line->dedup_processed = false;
+        line->dedup_in_process = false;
+    }
+    QTAILQ_FOREACH(line, &lm->victim_line_list, entry) {
+        line->dedup_processed = false;
+        line->dedup_in_process = false;
+    }
+    
+    ctx->dedup_in_progress = false;
+    ssd->write_after_dedup[ctx->current_ptn] = 0;
+    
+    my_log(ssd->fp_info, "Dedup complete for partition %d: total deduped %d / %d\n",
+        ctx->current_ptn, ssd->dedup_cnt, ssd->dedup_all);
+    
+    return -1;
 }
