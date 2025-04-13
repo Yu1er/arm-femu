@@ -180,6 +180,7 @@ static void ssd_init_lines(struct ssd *ssd)
             line->vpc = 0;
             line->dedup_processed = false;
             line->dedup_in_process = false;
+            line->GC_in_process = false;
             /* initialize all the lines as free lines */
             QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
             lm->free_line_cnt++;
@@ -984,6 +985,7 @@ static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
     line->is_FP_line = false;
     line->dedup_processed = false;
     line->dedup_in_process = false;
+    line->GC_in_process = false;
     /* move this line to free line list */
     QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
     lm->free_line_cnt++;
@@ -1004,6 +1006,7 @@ static int do_gc(struct ssd *ssd, int ptn_id, bool force)
         return -1;
     }
 
+    victim_line->GC_in_process = true;
     ppa.ppa = 0;
     ppa.g.blk = victim_line->id;
     /* copy back valid data */
@@ -1243,7 +1246,8 @@ uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
 
         while (should_gc_high(ssd, ptn_id)) {
             /* perform GC here until !should_gc(ssd) */
-            printf("FEMU: FTL doing blocking GC\n");
+            // printf("FEMU: FTL doing blocking GC\n");
+            my_log(ssd->fp_info, "Ptn %d doing blocking GC!!!!!!!!!!\n", ptn_id);
             r = do_gc(ssd, ptn_id, true);
             if (r == -1)
                 break;
@@ -1842,6 +1846,8 @@ static struct victim_select_result select_victim_segment(struct ssd *ssd, bool f
             my_assert(ssd, segment->metadata.line_id < ssd->sp.tt_lines, "Error: segment->metadata.line_id >= ssd->sp.tt_lines");
             lm = &ssd->lm[segment->metadata.ptn_id];
             line = &lm->lines[segment->metadata.line_id];
+            if(line->GC_in_process)
+                continue;
             if (line->ipc < min_ipc) {
                 // 优先选中非当前正在重删的分区
                 if(force || segment->metadata.ptn_id != ssd->dedup_ptn){

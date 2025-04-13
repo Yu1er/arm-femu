@@ -248,6 +248,7 @@ typedef struct line {
     int segment_count_inNVRAM;
     bool dedup_processed;    // 标记该line是否已在本次重删中处理
     bool dedup_in_process;   // 标记该line是否正在被重删处理
+    bool GC_in_process;     // 标记该line是否正在被GC处理
 } line;
 
 /* wp: record next write addr */
