@@ -1059,6 +1059,9 @@ static void *ftl_thread(void *arg)
     sprintf(ssd->info_file_name, "./SSDInfo_%d.log", ssd->id);
     init_file(ssd->fp_info, ssd->info_file_name);
     open_file(ssd->fp_info, ssd->info_file_name, "a");
+    sprintf(ssd->info_file_name, "./SSDInfo_clean_%d.log", ssd->id);
+    init_file(ssd->fp_info_clean, ssd->info_file_name);
+    open_file(ssd->fp_info_clean, ssd->info_file_name, "a");
     // sprintf(ssd->latency_file_name, "./SSDLatency_%d.log", ssd->id);
     // init_file(ssd->fp_latency, ssd->latency_file_name);
     // open_file(ssd->fp_latency, ssd->latency_file_name, "a");
@@ -1133,6 +1136,7 @@ static void *ftl_thread(void *arg)
         if (now < ssd->min_lun_avail_time) {
             // 如果正在进行重删,继续处理
             if (ssd->dedup_ctx.dedup_in_progress) {
+                ssd->time_for_dedup += (ssd->min_lun_avail_time - now) / 1e4;
                 do_dedup_partial(ssd);
             } 
             // 否则检查是否需要启动新的重删
@@ -1140,6 +1144,7 @@ static void *ftl_thread(void *arg)
                 int dedup_ptn = ssd->next_dedup_ptn;
                 while(1){
                     if (should_dedup(ssd, dedup_ptn)) {
+                        ssd->time_for_dedup += (ssd->min_lun_avail_time - now) / 1e4;
                         ssd->dedup_ptn = dedup_ptn;
                         ssd->dedup_cnt = 0;
                         ssd->dedup_all = 0;
@@ -1248,7 +1253,8 @@ uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
             /* perform GC here until !should_gc(ssd) */
             // printf("FEMU: FTL doing blocking GC\n");
             my_log(ssd->fp_info, "Ptn %d doing blocking GC!!!!!!!!!!\n", ptn_id);
-            r = do_gc(ssd, ptn_id, true);
+            for(int i = 0;i < ssd->sp.tt_ptns;i++) 
+                r = do_gc(ssd, i, true);
             if (r == -1)
                 break;
         }
@@ -1535,6 +1541,8 @@ inline void printf_info(struct ssd *ssd, bool force_print)
         my_log(ssd->fp_info, "time:%d, \
             tt_IOs:(%d,%d),(%d,%d),(%d,%d),(%d,%d), \
             tt_GC_IOs:(%d,%d,%d),(%d,%d,%d), \
+            tt_dedup:%d(%d), tt_dedup_handle:%d(%d), \
+            time_for_dedup:%d, \
             tt_FP_GC_IOs:(%d,%d),(%d,%d), \
             tt_RMM_IOs:(%d,%d),(%d,%d), \
             tt_FP_IOs:(%d,%d),(%d,%d), \
@@ -1549,6 +1557,8 @@ inline void printf_info(struct ssd *ssd, bool force_print)
             time_s, 
             ssd->tt_IOs[TOTAL][NAND_READ][USER_IO], ssd->tt_IOs[TOTAL][NAND_WRITE][USER_IO], ssd->tt_IOs[LAST_SECOND][NAND_READ][USER_IO], ssd->tt_IOs[LAST_SECOND][NAND_WRITE][USER_IO], ssd->tt_IOs[TOTAL][NAND_READ][METADATA_IO], ssd->tt_IOs[TOTAL][NAND_WRITE][METADATA_IO], ssd->tt_IOs[LAST_SECOND][NAND_READ][METADATA_IO], ssd->tt_IOs[LAST_SECOND][NAND_WRITE][METADATA_IO],
             ssd->tt_GC_IOs[TOTAL][NAND_READ], ssd->tt_GC_IOs[TOTAL][NAND_WRITE], ssd->tt_GC_IOs[TOTAL][NAND_ERASE], ssd->tt_GC_IOs[LAST_SECOND][NAND_READ], ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE], ssd->tt_GC_IOs[LAST_SECOND][NAND_ERASE],
+            ssd->tt_dedup[TOTAL], ssd->tt_dedup[LAST_SECOND], ssd->tt_dedup_handle[TOTAL], ssd->tt_dedup_handle[LAST_SECOND],
+            ssd->time_for_dedup,
             ssd->tt_GC_IOs[TOTAL][3], ssd->tt_GC_IOs[TOTAL][4], ssd->tt_GC_IOs[LAST_SECOND][3], ssd->tt_GC_IOs[LAST_SECOND][4],
             ssd->tt_RMM_IOs[TOTAL][NAND_READ], ssd->tt_RMM_IOs[TOTAL][NAND_WRITE], ssd->tt_RMM_IOs[LAST_SECOND][NAND_READ], ssd->tt_RMM_IOs[LAST_SECOND][NAND_WRITE],
             ssd->tt_FP_IOs[TOTAL][NAND_READ], ssd->tt_FP_IOs[TOTAL][NAND_WRITE], ssd->tt_FP_IOs[LAST_SECOND][NAND_READ], ssd->tt_FP_IOs[LAST_SECOND][NAND_WRITE],
@@ -1564,6 +1574,42 @@ inline void printf_info(struct ssd *ssd, bool force_print)
             ssd->g_malloc_FP_pages, ssd->g_free_FP_pages,
             ssd->cpu_cycle_tt);
 
+            my_log(ssd->fp_info_clean, "time:%d, \
+                tt_IOs:(%d,%d),(%d,%d),(%d,%d),(%d,%d), \
+                tt_GC_IOs:(%d,%d,%d),(%d,%d,%d), \
+                tt_dedup:%d(%d), tt_dedup_handle:%d(%d), \
+                time_for_dedup:%d, \
+                tt_FP_GC_IOs:(%d,%d),(%d,%d), \
+                tt_RMM_IOs:(%d,%d),(%d,%d), \
+                tt_FP_IOs:(%d,%d),(%d,%d), \
+                tt_remaps:%d(%d), \
+                R_MapTable_entris:%d(%d), RMMs:%d, RMM_pages:%d, \
+                valid_FPs:%d, valid_FP_pages:%d, \
+                TRIMs:%d(%d), \
+                metadata_pages:%d(%.2fGB), user_pages:%d(%.2fGB), RMM_pages:%d(%.2fGB), FP_pages:%d(%.2fGB),\
+                RMM_pages:(malloc,%d)(free,%d),\
+                FP_pages:(malloc,%d)(free,%d),\
+                cpu_cycle_tt:%ld\n",
+                time_s, 
+                ssd->tt_IOs[TOTAL][NAND_READ][USER_IO], ssd->tt_IOs[TOTAL][NAND_WRITE][USER_IO], ssd->tt_IOs[LAST_SECOND][NAND_READ][USER_IO], ssd->tt_IOs[LAST_SECOND][NAND_WRITE][USER_IO], ssd->tt_IOs[TOTAL][NAND_READ][METADATA_IO], ssd->tt_IOs[TOTAL][NAND_WRITE][METADATA_IO], ssd->tt_IOs[LAST_SECOND][NAND_READ][METADATA_IO], ssd->tt_IOs[LAST_SECOND][NAND_WRITE][METADATA_IO],
+                ssd->tt_GC_IOs[TOTAL][NAND_READ], ssd->tt_GC_IOs[TOTAL][NAND_WRITE], ssd->tt_GC_IOs[TOTAL][NAND_ERASE], ssd->tt_GC_IOs[LAST_SECOND][NAND_READ], ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE], ssd->tt_GC_IOs[LAST_SECOND][NAND_ERASE],
+                ssd->tt_dedup[TOTAL], ssd->tt_dedup[LAST_SECOND], ssd->tt_dedup_handle[TOTAL], ssd->tt_dedup_handle[LAST_SECOND],
+                ssd->time_for_dedup,
+                ssd->tt_GC_IOs[TOTAL][3], ssd->tt_GC_IOs[TOTAL][4], ssd->tt_GC_IOs[LAST_SECOND][3], ssd->tt_GC_IOs[LAST_SECOND][4],
+                ssd->tt_RMM_IOs[TOTAL][NAND_READ], ssd->tt_RMM_IOs[TOTAL][NAND_WRITE], ssd->tt_RMM_IOs[LAST_SECOND][NAND_READ], ssd->tt_RMM_IOs[LAST_SECOND][NAND_WRITE],
+                ssd->tt_FP_IOs[TOTAL][NAND_READ], ssd->tt_FP_IOs[TOTAL][NAND_WRITE], ssd->tt_FP_IOs[LAST_SECOND][NAND_READ], ssd->tt_FP_IOs[LAST_SECOND][NAND_WRITE],
+                ssd->tt_remaps[TOTAL], ssd->tt_remaps[LAST_SECOND], 
+                ssd->used_R_MapTable_entris, ssd->used_R_MapTable_parity_entris, ssd->valid_RMMs, ssd->valid_RMM_pages,
+                ssd->valid_FPs, ssd->valid_FP_pages,
+                ssd->tt_trims[TOTAL], ssd->tt_trims[LAST_SECOND],
+                ssd->type_page_count[metapage], (float)ssd->type_page_count[metapage]*4/1024/1024, 
+                ssd->type_page_count[userpage], (float)ssd->type_page_count[userpage]*4/1024/1024,
+                ssd->type_page_count[RMMpage], (float)ssd->type_page_count[RMMpage]*4/1024/1024,
+                ssd->type_page_count[FPpage], (float)ssd->type_page_count[FPpage]*4/1024/1024,
+                ssd->g_malloc_RMM_pages, ssd->g_free_RMM_pages,
+                ssd->g_malloc_FP_pages, ssd->g_free_FP_pages,
+                ssd->cpu_cycle_tt);
+
         // for(int i=0;i<ssd->sp.tt_ptns;i++) {
         //     my_log(ssd->fp_info, "ptn_%d = %d, ", i, ssd->ptns[i]);
         // }
@@ -1575,6 +1621,8 @@ inline void printf_info(struct ssd *ssd, bool force_print)
         ssd->tt_FP_IOs[LAST_SECOND][NAND_READ] = ssd->tt_FP_IOs[LAST_SECOND][NAND_WRITE] = 0;
         ssd->tt_remaps[LAST_SECOND] = 0;
         ssd->tt_trims[LAST_SECOND] = 0;
+        ssd->tt_dedup[LAST_SECOND] = 0;
+        ssd->tt_dedup_handle[LAST_SECOND] = 0;
     }
 }
 
@@ -2283,7 +2331,8 @@ static int FP_compare(const void *a, const void *b, void *udata) {
 static void add_RMM_to_line_rmap(struct ssd *ssd, struct line_rmap *line_rmap, struct RMM *RMM, int line_id, int ptn_id) {
     if(!is_valid_RMM(ssd, RMM, line_id, ptn_id))
         return;
-
+    my_assert(ssd, get_maptbl_ent(ssd, RMM->target_LPN, RMM->if_remote_lpn).g.blk == line_id,
+        "Error: get_maptbl_ent(ssd, RMM->target_LPN, RMM->if_remote_lpn).blk != line_id in add_RMM_to_line_rmap\n");
     uint64_t page_offset = RMM->offset;
     struct rmap_list *rmap = (struct rmap_list*)g_malloc0(sizeof(struct rmap_list)); 
     rmap->lpn = RMM->target_LPN;
@@ -2298,7 +2347,8 @@ static void add_rmap_to_line_rmap(struct ssd *ssd, struct line_rmap *line_rmap, 
     if(elem.lpn == INVALID_LPN || elem.lpn == RMM_PAGE || elem.lpn == FP_PAGE) {
         return;
     }
-    
+    my_assert(ssd, get_maptbl_ent(ssd, elem.lpn, false).ppa == ppa->ppa,
+        "Error: get_maptbl_ent(ssd, elem.lpn, false).ppa != ppa->ppa in add_rmap_to_line_rmap\n");
     uint64_t page_offset = ppa_to_OffsetInLine(ssd, ppa);
     struct rmap_list *rmap = (struct rmap_list*)g_malloc0(sizeof(struct rmap_list));
     rmap->lpn = elem.lpn;
@@ -2369,8 +2419,8 @@ static void handle_duplicate_page(struct ssd *ssd, struct ppa *exist_ppa, struct
         elem.RMM_page_p = NULL;
         elem.FP_page_p = NULL;
 
-        my_assert(ssd, old_ppa->ppa == get_maptbl_ent(ssd, elem.lpn, false).ppa, 
-            "Error: old_ppa != get_maptbl_ent(ssd, elem.lpn, false).ppa in handle_duplicate_page\n");
+        if(old_ppa->ppa != get_maptbl_ent(ssd, elem.lpn, false).ppa)
+            my_log(ssd->fp_info, "Error: old_ppa != get_maptbl_ent(ssd, elem.lpn, false).ppa in handle_duplicate_page\n");
         // if (mapped_ppa(old_ppa)) {
         delete_reference(ssd, false, old_ppa, elem);
         // }
@@ -2520,7 +2570,7 @@ static struct line *find_next_line_to_dedup(struct ssd *ssd, int ptn_id)
     }
     
     if (all_processed) {
-        my_log(ssd->fp_info, "All lines in partition %d have been processed\n", ptn_id);
+        my_log(ssd->fp_info, "All lines in partition %d have been processed. ", ptn_id);
         return NULL;
     }
     
@@ -2646,8 +2696,12 @@ int do_dedup_partial(struct ssd *ssd)
                 else 
                     handle_duplicate_page(ssd, &exist_kv->ppa, &ppa, ctx->line_rmap->ppa_rmaps[page_offset]);
                 ssd->dedup_cnt++;
+                ssd->tt_dedup[LAST_SECOND]++;
+                ssd->tt_dedup[TOTAL]++;
             }
             ssd->dedup_all++;
+            ssd->tt_dedup_handle[LAST_SECOND]++;
+            ssd->tt_dedup_handle[TOTAL]++;
             processed++;
         }
 
@@ -2686,8 +2740,7 @@ dedup_complete:
     ctx->dedup_in_progress = false;
     ssd->write_after_dedup[ctx->current_ptn] = 0;
     
-    my_log(ssd->fp_info, "Dedup complete for partition %d: total deduped %d / %d\n",
-        ctx->current_ptn, ssd->dedup_cnt, ssd->dedup_all);
+    my_log(ssd->fp_info, "total deduped %d / %d\n", ssd->dedup_cnt, ssd->dedup_all);
     
     return -1;
 }

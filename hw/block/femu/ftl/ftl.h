@@ -145,6 +145,7 @@ struct nand_page {
     int nsecs;
     int status;
     int refcount;
+    int deduped;
 };
 
 struct nand_block {
@@ -249,6 +250,7 @@ typedef struct line {
     bool dedup_processed;    // 标记该line是否已在本次重删中处理
     bool dedup_in_process;   // 标记该line是否正在被重删处理
     bool GC_in_process;     // 标记该line是否正在被GC处理
+    bool should_dedup;
 } line;
 
 /* wp: record next write addr */
@@ -346,6 +348,7 @@ struct ssd {
     //statistics
     char info_file_name[100];
     FILE* fp_info;
+    FILE* fp_info_clean;
     FILE* fp_debug_info;
     char latency_file_name[100];
     FILE* fp_latency;
@@ -357,6 +360,9 @@ struct ssd {
     uint64_t tt_RMM_IOs[2][2];
     uint64_t tt_remaps[2];
     uint64_t tt_trims[2];
+    uint64_t tt_dedup[2];
+    uint64_t tt_dedup_handle[2];
+    uint64_t time_for_dedup;
     uint64_t used_R_MapTable_entris;
     uint64_t used_R_MapTable_parity_entris;
     uint64_t valid_RMMs;
@@ -384,6 +390,7 @@ struct ssd {
 
     struct dedup_ctx dedup_ctx; //重删上下文
     int next_dedup_ptn; //上次重删的分区号
+    int dedup_times[64]; //每个分区的重删次数
 };
 
 extern uint16_t ssd_id_cnt;
