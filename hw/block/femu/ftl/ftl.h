@@ -313,6 +313,7 @@ struct dedup_ctx{
     int current_fp_page_idx;         // 当前处理的指纹页的位置
     int current_fp_idx;              // 当前指纹页处理到的位置
     struct line_rmap *line_rmap;     // 当前line的反向映射缓存
+    bool *page_in_btree;             // 正在重删的分区中每个page是否在指纹树中
 };
 
 struct ssd {

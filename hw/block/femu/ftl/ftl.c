@@ -38,6 +38,7 @@ void ssd_init_FP_page(struct ssd *ssd);
 void FP_migration(struct ssd *ssd, struct line *line, int ptn_id);
 int do_dedup(struct ssd *ssd, int ptn_id);
 int do_dedup_partial(struct ssd *ssd);
+uint64_t ppa_to_OffsetInPtn(struct ssd *ssd, struct ppa *ppa);
 
 /* 打印调用栈的最大深度 */
 #define DUMP_STACK_DEPTH_MAX 16
@@ -387,10 +388,10 @@ static void ssd_init_params(struct ssdparams *spp)
 
     spp->gc_thres_pcent = 0.9;
     spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);
-    spp->gc_thres_pcent_high = 0.95;
+    spp->gc_thres_pcent_high = 0.98;
     spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
 
-    spp->dedup_thres_pcent = 0.5;
+    spp->dedup_thres_pcent = 0.2;
     spp->dedup_thres_writes = (int)(spp->dedup_thres_pcent * spp->pgs_per_lun * spp->luns_per_ptn);
 
     printf("spp->pgs_per_line: %d\n", spp->pgs_per_line);
@@ -1764,6 +1765,15 @@ inline struct ppa OffsetInLine_to_ppa(struct ssd *ssd, uint64_t offset, uint64_t
     return ppa;
 }
 
+inline uint64_t ppa_to_OffsetInPtn(struct ssd *ssd, struct ppa *ppa)
+{
+    struct ssdparams *spp = &ssd->sp;
+    int offset_in_line = ppa_to_OffsetInLine(ssd, ppa);
+    uint64_t res = ppa->g.blk * spp->pgs_per_line + offset_in_line;
+    my_assert(ssd, res < ssd->sp.pgs_per_line * ssd->sp.blks_per_pl, "error in ppa_to_offsetinline: res=%lu, ppa=%lu\n", res, ppa->ppa);
+    return res;
+}
+
 inline struct RMM_page *get_RMM_page(struct ssd *ssd, int ptn_id)
 {
     struct RMM_page *RMM_page = g_malloc0(sizeof(struct RMM_page));
@@ -2267,15 +2277,17 @@ void FP_migration(struct ssd *ssd, struct line *line, int ptn_id)
 
         if(line->dedup_processed){
             struct FPKV *FP_kv_old, FP_kv_find;
+            int offset_in_ptn = ppa_to_OffsetInPtn(ssd, &old_ppa);
             if(new_ppa.ppa == UNMAPPED_PPA){
-                memcpy(FP_kv_find.key, old_FP_page->FP_entrys[old_FP_entry_idx].FP, FP_SIZE);
-                FP_kv_old = btree_get(ssd->dedup_ctx.fp_tree, &FP_kv_find);//page可能在重删前就已经成为无效页,所以指纹索引中可能不存在该page的指纹
-                if(FP_kv_old && FP_kv_old->ppa.ppa == old_ppa.ppa)
+                if(ssd->dedup_ctx.page_in_btree[offset_in_ptn]){
                     FP_kv_old = btree_delete(ssd->dedup_ctx.fp_tree, old_FP_page->FP_entrys[old_FP_entry_idx].FP);
+                    ssd->dedup_ctx.page_in_btree[offset_in_ptn] = false;
+                }
             }
             else{
                 FP_kv_old = btree_delete(ssd->dedup_ctx.fp_tree, old_FP_page->FP_entrys[old_FP_entry_idx].FP);
                 my_assert(ssd, FP_kv_old->ppa.ppa == old_ppa.ppa, "Error: FP_kv_old->ppa != old_ppa in FP_migration");
+                ssd->dedup_ctx.page_in_btree[offset_in_ptn] = false;
             }
         }
 
@@ -2631,6 +2643,7 @@ int do_dedup_partial(struct ssd *ssd)
         
         // 设置正在处理标记
         ctx->current_line->dedup_in_process = true;
+        ctx->page_in_btree = g_malloc0(sizeof(bool) * ssd->sp.pgs_per_line * ssd->sp.blks_per_pl);
         
         my_log(ssd->fp_info, "Start dedup for partition %d\n", ctx->current_ptn);
     }
@@ -2688,9 +2701,17 @@ int do_dedup_partial(struct ssd *ssd)
             if (!exist_kv) {
                 fp_kv.ppa = ppa;
                 btree_set(ctx->fp_tree, &fp_kv);
+                int offset_in_ptn = ppa_to_OffsetInPtn(ssd, &fp_kv.ppa);
+                ctx->page_in_btree[offset_in_ptn] = true;
             } else {
                 if(get_pg(ssd, &exist_kv->ppa)->status == PG_INVALID){
                     fp_kv.ppa = ppa;
+                    int old_offset_in_ptn = ppa_to_OffsetInPtn(ssd, &exist_kv->ppa);
+                    int offset_in_ptn = ppa_to_OffsetInPtn(ssd, &fp_kv.ppa);
+                    my_assert(ssd, ctx->page_in_btree[old_offset_in_ptn] == true, "Error: page_in_btree[%d] != true", old_offset_in_ptn);
+                    my_assert(ssd, ctx->page_in_btree[offset_in_ptn] == false, "Error: page_in_btree[%d] != false", offset_in_ptn);
+                    ctx->page_in_btree[old_offset_in_ptn] = false;
+                    ctx->page_in_btree[offset_in_ptn] = true;
                     btree_set(ctx->fp_tree, &fp_kv);
                 }
                 else 
@@ -2738,6 +2759,8 @@ dedup_complete:
     }
     
     ctx->dedup_in_progress = false;
+    g_free(ctx->page_in_btree);
+    ctx->page_in_btree = NULL;
     ssd->write_after_dedup[ctx->current_ptn] = 0;
     
     my_log(ssd->fp_info, "total deduped %d / %d\n", ssd->dedup_cnt, ssd->dedup_all);
