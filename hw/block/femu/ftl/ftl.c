@@ -2275,19 +2275,22 @@ void FP_migration(struct ssd *ssd, struct line *line, int ptn_id)
             old_FP_page = QTAILQ_NEXT(old_FP_page, entry);
         }
 
-        if(line->dedup_processed){
-            struct FPKV *FP_kv_old, FP_kv_find;
-            int offset_in_ptn = ppa_to_OffsetInPtn(ssd, &old_ppa);
+        int old_offset_in_ptn = ppa_to_OffsetInPtn(ssd, &old_ppa);
+        if(ssd->dedup_ctx.dedup_in_progress && ssd->dedup_ptn == ptn_id && ssd->dedup_ctx.page_in_btree[old_offset_in_ptn]){
+            struct FPKV *FP_kv_old, FP_kv_new;
             if(new_ppa.ppa == UNMAPPED_PPA){
-                if(ssd->dedup_ctx.page_in_btree[offset_in_ptn]){
-                    FP_kv_old = btree_delete(ssd->dedup_ctx.fp_tree, old_FP_page->FP_entrys[old_FP_entry_idx].FP);
-                    ssd->dedup_ctx.page_in_btree[offset_in_ptn] = false;
-                }
-            }
-            else{
                 FP_kv_old = btree_delete(ssd->dedup_ctx.fp_tree, old_FP_page->FP_entrys[old_FP_entry_idx].FP);
                 my_assert(ssd, FP_kv_old->ppa.ppa == old_ppa.ppa, "Error: FP_kv_old->ppa != old_ppa in FP_migration");
-                ssd->dedup_ctx.page_in_btree[offset_in_ptn] = false;
+                ssd->dedup_ctx.page_in_btree[old_offset_in_ptn] = false;
+            }
+            else{
+                FP_kv_new.ppa = new_ppa;
+                memcpy(FP_kv_new.key, old_FP_page->FP_entrys[old_FP_entry_idx].FP, FP_SIZE);
+                FP_kv_old = btree_set(ssd->dedup_ctx.fp_tree, &FP_kv_new);
+                my_assert(ssd, FP_kv_old->ppa.ppa == old_ppa.ppa, "Error: FP_kv_old->ppa != old_ppa in FP_migration");
+                int new_offset_in_ptn = ppa_to_OffsetInPtn(ssd, &new_ppa);
+                ssd->dedup_ctx.page_in_btree[old_offset_in_ptn] = false;
+                ssd->dedup_ctx.page_in_btree[new_offset_in_ptn] = true;
             }
         }
 
@@ -2693,7 +2696,8 @@ int do_dedup_partial(struct ssd *ssd)
         struct ppa ppa = OffsetInLine_to_ppa(ssd, page_offset, 
                                            ctx->current_line->id, ctx->current_ptn);
         
-        if (get_pg(ssd, &ppa)->status == PG_VALID) {
+        int offset_in_ptn = ppa_to_OffsetInPtn(ssd, &ppa);
+        if (get_pg(ssd, &ppa)->status == PG_VALID && ctx->page_in_btree[offset_in_ptn] == false) {
             struct FPKV fp_kv;
             memcpy(fp_kv.key, ctx->current_fp_page->FP_entrys[ctx->current_fp_idx].FP, FP_SIZE);
             
@@ -2701,13 +2705,11 @@ int do_dedup_partial(struct ssd *ssd)
             if (!exist_kv) {
                 fp_kv.ppa = ppa;
                 btree_set(ctx->fp_tree, &fp_kv);
-                int offset_in_ptn = ppa_to_OffsetInPtn(ssd, &fp_kv.ppa);
                 ctx->page_in_btree[offset_in_ptn] = true;
             } else {
                 if(get_pg(ssd, &exist_kv->ppa)->status == PG_INVALID){
                     fp_kv.ppa = ppa;
                     int old_offset_in_ptn = ppa_to_OffsetInPtn(ssd, &exist_kv->ppa);
-                    int offset_in_ptn = ppa_to_OffsetInPtn(ssd, &fp_kv.ppa);
                     my_assert(ssd, ctx->page_in_btree[old_offset_in_ptn] == true, "Error: page_in_btree[%d] != true", old_offset_in_ptn);
                     my_assert(ssd, ctx->page_in_btree[offset_in_ptn] == false, "Error: page_in_btree[%d] != false", offset_in_ptn);
                     ctx->page_in_btree[old_offset_in_ptn] = false;

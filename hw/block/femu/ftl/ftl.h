@@ -145,7 +145,6 @@ struct nand_page {
     int nsecs;
     int status;
     int refcount;
-    int deduped;
 };
 
 struct nand_block {
