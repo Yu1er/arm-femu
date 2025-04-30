@@ -784,6 +784,12 @@ typedef struct NvmeRequest {
     size_t                  pos;
 
     uint8_t FP[16];  // 16字节指纹,用于分区选择
+
+    union {
+        uint8_t u8[16];
+        uint32_t u32[4];
+        uint64_t u64[2];
+    } fingerprint;
 } NvmeRequest;
 
 typedef struct DMAOff {
@@ -948,6 +954,20 @@ typedef struct FemuCtrl {
     struct femu_mbe mbe;
     //struct femu_mbe remote_mbe;
     int             completed;
+
+    /* BBSSD parameters */
+    char            *log_file;
+    uint32_t        secsz;        /* sector size in bytes */
+    uint32_t        secs_per_pg;  /* # of sectors per page */
+    uint32_t        pgs_per_blk;  /* # of NAND pages per block */
+    uint32_t        blks_per_pl;  /* # of blocks per plane */
+    uint32_t        pls_per_lun;  /* # of planes per LUN (Die) */
+    uint32_t        luns_per_ch;  /* # of LUNs per channel */
+    uint32_t        nchs;         /* # of channels in the SSD */
+    uint32_t        pg_rd_lat;    /* NAND page read latency in nanoseconds */
+    uint32_t        pg_wr_lat;    /* NAND page program latency in nanoseconds */
+    uint32_t        blk_er_lat;   /* NAND block erase latency in nanoseconds */
+    uint32_t        gc_thres_pcent;
 
     char            devname[64];
     struct rte_ring *to_ftl;

@@ -290,6 +290,8 @@ static uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     uint64_t slba = le64_to_cpu(rw->slba);
     uint64_t prp1 = le64_to_cpu(rw->prp1);
     uint64_t prp2 = le64_to_cpu(rw->prp2);
+    uint64_t fingerprintA = le64_to_cpu(rw->rsvd2);
+    uint64_t fingerprintB = le64_to_cpu(rw->mptr);
     const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
     const uint16_t ms = le16_to_cpu(ns->id_ns.lbaf[lba_index].ms);
     const uint8_t data_shift = ns->id_ns.lbaf[lba_index].ds;
@@ -327,6 +329,11 @@ static uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     req->status = NVME_SUCCESS;
     req->nlb = nlb;
     req->ns = ns;
+    req->fingerprint.u64[0] = fingerprintA;
+    req->fingerprint.u64[1] = fingerprintB;
+    // if(req->fingerprint.u64[0] != 0 || req->fingerprint.u64[1] != 0) {
+    //     my_log(ssd->fp_info_FP, "FPA:%lu, FPB:%lu\n", req->fingerprint.u64[0], req->fingerprint.u64[1])
+    // }
     //req->expire_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);// + 100000;
 
 #if 0
@@ -806,6 +813,13 @@ static void nvme_write_bar(FemuCtrl *n, hwaddr offset, uint64_t data,
         n->bar.intmc = n->bar.intms;
         break;
     case 0x14:
+        /* If first sending data, then sending enable bit */
+        if (!NVME_CC_EN(data) && !NVME_CC_EN(n->bar.cc) &&
+                !NVME_CC_SHN(data) && !NVME_CC_SHN(n->bar.cc))
+        {
+            n->bar.cc = data;
+        }
+
         if (NVME_CC_EN(data) && !NVME_CC_EN(n->bar.cc)) {
             n->bar.cc = data;
             if (nvme_start_ctrl(n)) {
@@ -1427,6 +1441,18 @@ static Property femu_props[] = {
     DEFINE_PROP_UINT32("ln_err_write", FemuCtrl, femu_oc_ctrl.n_err_write, 0),
     DEFINE_PROP_UINT8("ldebug", FemuCtrl, femu_oc_ctrl.debug, 0),
     DEFINE_PROP_UINT8("lstrict", FemuCtrl, femu_oc_ctrl.strict, 0),
+    DEFINE_PROP_UINT32("secsz", FemuCtrl, secsz, 512),
+    DEFINE_PROP_UINT32("secs_per_pg", FemuCtrl, secs_per_pg, 8),
+    DEFINE_PROP_UINT32("pgs_per_blk", FemuCtrl, pgs_per_blk, 256),
+    DEFINE_PROP_UINT32("blks_per_pl", FemuCtrl, blks_per_pl, 256),
+    DEFINE_PROP_UINT32("pls_per_lun", FemuCtrl, pls_per_lun, 1),
+    DEFINE_PROP_UINT32("luns_per_ch", FemuCtrl, luns_per_ch, 8),
+    DEFINE_PROP_UINT32("nchs", FemuCtrl, nchs, 8),
+    DEFINE_PROP_UINT32("pg_rd_lat", FemuCtrl, pg_rd_lat, 40000),
+    DEFINE_PROP_UINT32("pg_wr_lat", FemuCtrl, pg_wr_lat, 200000),
+    DEFINE_PROP_UINT32("blk_er_lat", FemuCtrl, blk_er_lat, 2000000),
+    DEFINE_PROP_UINT32("gc_thres_pcent", FemuCtrl, gc_thres_pcent, 75),
+    // DEFINE_PROP_STRING("log_file", FemuCtrl, log_file),
     DEFINE_PROP_END_OF_LIST(),
 };
 

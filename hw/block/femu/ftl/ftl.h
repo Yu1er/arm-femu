@@ -317,6 +317,7 @@ struct dedup_ctx{
 
 struct ssd {
     char *ssdname;
+    // char *log_file;
     struct ssdparams sp;
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
@@ -349,6 +350,7 @@ struct ssd {
     char info_file_name[100];
     FILE* fp_info;
     FILE* fp_info_clean;
+    FILE* fp_info_FP;
     FILE* fp_debug_info;
     char latency_file_name[100];
     FILE* fp_latency;
