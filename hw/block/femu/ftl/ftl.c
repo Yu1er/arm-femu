@@ -374,7 +374,7 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
     spp->tt_luns = spp->luns_per_ch * spp->nchs;
 
     /* 初始化分区参数 */
-    spp->luns_per_ptn = 8;  // 每个分区包含2个LUN，可配置
+    spp->luns_per_ptn = n->luns_per_ptn;  // 每个分区包含2个LUN，可配置
     spp->tt_ptns = spp->tt_luns / spp->luns_per_ptn;  // 总分区数
     
     /* 确保LUN数量能被分区大小整除 */
@@ -388,10 +388,10 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
 
     spp->gc_thres_pcent = (double)n->gc_thres_pcent / 100.0;
     spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);
-    spp->gc_thres_pcent_high = 0.98;
+    spp->gc_thres_pcent_high = (double)n->gc_thres_pcent_high / 100.0;;
     spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
 
-    spp->dedup_thres_pcent = 0.2;
+    spp->dedup_thres_pcent = (double)n->dedup_thres_pcent / 100.0;
     spp->dedup_thres_writes = (int)(spp->dedup_thres_pcent * spp->pgs_per_lun * spp->luns_per_ptn);
 
     printf("spp->pgs_per_line: %d\n", spp->pgs_per_line);
