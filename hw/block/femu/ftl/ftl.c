@@ -337,19 +337,19 @@ static void check_params(struct ssdparams *spp)
     //assert(is_power_of_2(spp->nchs));
 }
 
-static void ssd_init_params(struct ssdparams *spp)
+static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
 {
-    spp->secsz = 512;
-    spp->secs_per_pg = 8;
-    spp->pgs_per_blk = 256;
-    spp->blks_per_pl = 320; /*Per SSD: 20GB:320(4)  16GB:256(4+1)  13.3G:213(5+1)  11.4G:182(6+1)  8.8G:142(8+1)*/
-    spp->pls_per_lun = 1;
-    spp->luns_per_ch = 8;
-    spp->nchs = 8;
+    spp->secsz = n->secsz;
+    spp->secs_per_pg = n->secs_per_pg;
+    spp->pgs_per_blk = n->pgs_per_blk;
+    spp->blks_per_pl = n->blks_per_pl; /*Per SSD: 20GB:320(4)  16GB:256(4+1)  13.3G:213(5+1)  11.4G:182(6+1)  8.8G:142(8+1)*/
+    spp->pls_per_lun = n->pls_per_lun;
+    spp->luns_per_ch = n->luns_per_ch;
+    spp->nchs = n->nchs;
 
-    spp->pg_rd_lat = 40000;
-    spp->pg_wr_lat = 140000;
-    spp->blk_er_lat = 3000000;
+    spp->pg_rd_lat = n->pg_rd_lat;
+    spp->pg_wr_lat = n->pg_wr_lat;
+    spp->blk_er_lat = n->blk_er_lat;
     spp->ch_xfer_lat = 60000;      // IODA：A Host Device Co-Design for Strong Predictability Contract on Modern Flash Storage (SOSP'21)
 
     /* calculated values */
@@ -374,7 +374,7 @@ static void ssd_init_params(struct ssdparams *spp)
     spp->tt_luns = spp->luns_per_ch * spp->nchs;
 
     /* 初始化分区参数 */
-    spp->luns_per_ptn = 8;  // 每个分区包含2个LUN，可配置
+    spp->luns_per_ptn = n->luns_per_ptn;  // 每个分区包含2个LUN，可配置
     spp->tt_ptns = spp->tt_luns / spp->luns_per_ptn;  // 总分区数
     
     /* 确保LUN数量能被分区大小整除 */
@@ -386,12 +386,12 @@ static void ssd_init_params(struct ssdparams *spp)
     spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
     spp->tt_lines = spp->blks_per_lun; /* TODO: to fix under multiplanes */
 
-    spp->gc_thres_pcent = 0.9;
+    spp->gc_thres_pcent = (double)n->gc_thres_pcent / 100.0;
     spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);
-    spp->gc_thres_pcent_high = 0.98;
+    spp->gc_thres_pcent_high = (double)n->gc_thres_pcent_high / 100.0;
     spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
 
-    spp->dedup_thres_pcent = 0.2;
+    spp->dedup_thres_pcent = (double)n->dedup_thres_pcent / 100.0;
     spp->dedup_thres_writes = (int)(spp->dedup_thres_pcent * spp->pgs_per_lun * spp->luns_per_ptn);
 
     printf("spp->pgs_per_line: %d\n", spp->pgs_per_line);
@@ -510,7 +510,7 @@ void ssd_init(FemuCtrl *n)
     ssd->last_print_time_s = 0;
     ssd->test_begin = true;
 
-    ssd_init_params(spp);
+    ssd_init_params(spp, n);
 
     /* initialize ssd internal layout architecture */
     ssd->ch = g_malloc0(sizeof(struct ssd_channel) * spp->nchs);
