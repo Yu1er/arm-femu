@@ -86,6 +86,15 @@ static inline bool should_gc_high(struct ssd *ssd, int ptn_id)
     return (ssd->lm[ptn_id].free_line_cnt < ssd->sp.gc_thres_lines_high);
 }
 
+static inline bool should_gc_all(struct ssd *ssd)
+{
+    int free_line_cnt = 0;
+    for(int ptn = 0; ptn < ssd->sp.tt_ptns; ptn++) {
+        free_line_cnt += ssd->lm[ptn].free_line_cnt;
+    }
+    return (free_line_cnt <= ssd->sp.gc_thres_lines * ssd->sp.tt_ptns);
+}
+
 inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn, bool if_remote_lpn)
 {
     my_assert(ssd, lpn != RMM_PAGE, "error, there is no maptbl for RMM_PAGE\n");
@@ -1078,8 +1087,10 @@ static void *ftl_thread(void *arg)
         /* clean one line if needed (in the background) */
         if(req->opcode == NVME_CMD_WRITE) {
             // int ptn_id = (ptn_num + ssd->sp.tt_ptns - 1) % ssd->sp.tt_ptns;
-            for(int i = 0;i < ssd->sp.tt_ptns;i++) {
-                if (should_gc(ssd, i)) {
+            // for(int i = 0;i < ssd->sp.tt_ptns;i++) {
+            //     if (should_gc(ssd, i)) {
+            if(should_gc_all(ssd)) {
+                for(int i = 0;i < ssd->sp.tt_ptns;i++) {
                     do_gc(ssd, i, false);
                 }
             }
