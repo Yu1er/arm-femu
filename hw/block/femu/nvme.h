@@ -960,10 +960,12 @@ typedef struct FemuCtrl {
     uint32_t        pg_rd_lat;    /* NAND page read latency in nanoseconds */
     uint32_t        pg_wr_lat;    /* NAND page program latency in nanoseconds */
     uint32_t        blk_er_lat;   /* NAND block erase latency in nanoseconds */
+    uint32_t        ch_xfer_lat;
     uint32_t        gc_thres_pcent;
     uint32_t        gc_thres_pcent_high;
     uint32_t        luns_per_ptn;
     uint32_t        dedup_thres_pcent;
+    uint32_t        memory_size;
 
     char            devname[64];
     struct rte_ring *to_ftl;

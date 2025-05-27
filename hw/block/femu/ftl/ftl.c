@@ -350,7 +350,7 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
     spp->pg_rd_lat = n->pg_rd_lat;
     spp->pg_wr_lat = n->pg_wr_lat;
     spp->blk_er_lat = n->blk_er_lat;
-    spp->ch_xfer_lat = 60000;      // IODA：A Host Device Co-Design for Strong Predictability Contract on Modern Flash Storage (SOSP'21)
+    spp->ch_xfer_lat = n->ch_xfer_lat;      // IODA：A Host Device Co-Design for Strong Predictability Contract on Modern Flash Storage (SOSP'21)
 
     /* calculated values */
     spp->secs_per_blk = spp->secs_per_pg * spp->pgs_per_blk;
@@ -393,6 +393,7 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
 
     spp->dedup_thres_pcent = (double)n->dedup_thres_pcent / 100.0;
     spp->dedup_thres_writes = (int)(spp->dedup_thres_pcent * spp->pgs_per_lun * spp->luns_per_ptn);
+    spp->memory_size = n->memory_size; // in ptn
 
     printf("spp->pgs_per_line: %d\n", spp->pgs_per_line);
     printf("spp->tt_lines: %d\n", spp->tt_lines);
@@ -2651,6 +2652,12 @@ int do_dedup_partial(struct ssd *ssd)
         my_log(ssd->fp_info, "Start dedup for partition %d\n", ctx->current_ptn);
     }
 
+    //模拟cache
+    int N = ssd->sp.tt_pgs;//总指纹数量
+    int n = 200;//每个page可存储200个项（4096/(16+4)）
+    int tree_hight = (N <= 8000000) ? 3 : 4; // 根据总指纹数量决定B树高度(log200(N/200)+1)
+    int numerator = (ssd->sp.luns_per_ptn < ssd->sp.memory_size) ? 0 : (ssd->sp.luns_per_ptn - ssd->sp.memory_size);
+
     while (1) {
         now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         if (now >= ssd->min_lun_avail_time) {
@@ -2698,6 +2705,10 @@ int do_dedup_partial(struct ssd *ssd)
         
         int offset_in_ptn = ppa_to_OffsetInPtn(ssd, &ppa);
         if (get_pg(ssd, &ppa)->status == PG_VALID && ctx->page_in_btree[offset_in_ptn] == false) {
+            // 模拟cache
+            int search_time = tree_hight * (ssd->sp.pg_rd_lat + ssd->sp.ch_xfer_lat) * numerator / ssd->sp.luns_per_ptn / ssd->sp.tt_luns;
+            int miss_write_time = 0;//未命中的写开销
+
             struct FPKV fp_kv;
             memcpy(fp_kv.key, ctx->current_fp_page->FP_entrys[ctx->current_fp_idx].FP, FP_SIZE);
             
@@ -2706,6 +2717,8 @@ int do_dedup_partial(struct ssd *ssd)
                 fp_kv.ppa = ppa;
                 btree_set(ctx->fp_tree, &fp_kv);
                 ctx->page_in_btree[offset_in_ptn] = true;
+                //模拟cache
+                miss_write_time = (ssd->sp.pg_wr_lat + ssd->sp.ch_xfer_lat) * numerator / ssd->sp.luns_per_ptn / ssd->sp.tt_luns;
             } else {
                 if(get_pg(ssd, &exist_kv->ppa)->status == PG_INVALID){
                     fp_kv.ppa = ppa;
@@ -2721,6 +2734,17 @@ int do_dedup_partial(struct ssd *ssd)
                 ssd->dedup_cnt++;
                 ssd->tt_dedup[LAST_SECOND]++;
                 ssd->tt_dedup[TOTAL]++;
+            }
+            //模拟cache
+            int penelty = search_time + miss_write_time;
+            if(penelty){
+                for(int chp = 0; chp < ssd->sp.nchs; chp++) {
+                    struct ssd_channel *ch = &ssd->ch[chp];
+                    for(int lunp = 0; lunp < ssd->sp.luns_per_ch; lunp++) {
+                        struct nand_lun *l = &ch->lun[lunp];
+                        l->next_lun_avail_time = l->next_lun_avail_time + penelty;
+                    }
+                }
             }
             ssd->dedup_all++;
             ssd->tt_dedup_handle[LAST_SECOND]++;

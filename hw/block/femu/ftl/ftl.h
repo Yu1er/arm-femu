@@ -231,6 +231,7 @@ struct ssdparams {
 
     double dedup_thres_pcent;
     int dedup_thres_writes;
+    int memory_size;
 };
 
 typedef struct line {
