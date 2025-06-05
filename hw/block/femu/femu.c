@@ -1451,10 +1451,12 @@ static Property femu_props[] = {
     DEFINE_PROP_UINT32("pg_rd_lat", FemuCtrl, pg_rd_lat, 40000),
     DEFINE_PROP_UINT32("pg_wr_lat", FemuCtrl, pg_wr_lat, 200000),
     DEFINE_PROP_UINT32("blk_er_lat", FemuCtrl, blk_er_lat, 2000000),
+    DEFINE_PROP_UINT32("ch_xfer_lat", FemuCtrl, ch_xfer_lat, 60000),
     DEFINE_PROP_UINT32("gc_thres_pcent", FemuCtrl, gc_thres_pcent, 75),
     DEFINE_PROP_UINT32("gc_thres_pcent_high", FemuCtrl, gc_thres_pcent_high, 95),
     DEFINE_PROP_UINT32("luns_per_ptn", FemuCtrl, luns_per_ptn, 8),
     DEFINE_PROP_UINT32("dedup_thres_pcent", FemuCtrl, dedup_thres_pcent, 20),
+    DEFINE_PROP_UINT32("memory_size", FemuCtrl, memory_size, 1),
     // DEFINE_PROP_STRING("log_file", FemuCtrl, log_file),
     DEFINE_PROP_END_OF_LIST(),
 };
