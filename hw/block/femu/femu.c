@@ -1457,6 +1457,7 @@ static Property femu_props[] = {
     DEFINE_PROP_UINT32("luns_per_ptn", FemuCtrl, luns_per_ptn, 8),
     DEFINE_PROP_UINT32("dedup_thres_pcent", FemuCtrl, dedup_thres_pcent, 20),
     DEFINE_PROP_UINT32("memory_size", FemuCtrl, memory_size, 1),
+    DEFINE_PROP_UINT32("dedup_switch", FemuCtrl, dedup_switch, 1),
     // DEFINE_PROP_STRING("log_file", FemuCtrl, log_file),
     DEFINE_PROP_END_OF_LIST(),
 };

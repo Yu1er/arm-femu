@@ -232,6 +232,7 @@ struct ssdparams {
     double dedup_thres_pcent;
     int dedup_thres_writes;
     int memory_size;
+    int dedup_switch;
 };
 
 typedef struct line {
@@ -351,8 +352,11 @@ struct ssd {
     char info_file_name[100];
     FILE* fp_info;
     FILE* fp_info_clean;
+    FILE* fp_info_clean_test;
     FILE* fp_info_FP;
     FILE* fp_debug_info;
+    FILE* warm_flag;
+    int warm_done;
     char latency_file_name[100];
     FILE* fp_latency;
     uint64_t metadata_offset;
