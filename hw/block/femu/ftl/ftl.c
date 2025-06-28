@@ -350,7 +350,8 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
     spp->pg_rd_lat = n->pg_rd_lat;
     spp->pg_wr_lat = n->pg_wr_lat;
     spp->blk_er_lat = n->blk_er_lat;
-    spp->ch_xfer_lat = n->ch_xfer_lat;      // IODA：A Host Device Co-Design for Strong Predictability Contract on Modern Flash Storage (SOSP'21)
+    // spp->ch_xfer_lat = n->ch_xfer_lat;      // IODA：A Host Device Co-Design for Strong Predictability Contract on Modern Flash Storage (SOSP'21)
+    spp->ch_xfer_lat = 0;
 
     /* calculated values */
     spp->secs_per_blk = spp->secs_per_pg * spp->pgs_per_blk;
@@ -394,6 +395,7 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
     spp->dedup_thres_pcent = (double)n->dedup_thres_pcent / 100.0;
     spp->dedup_thres_writes = (int)(spp->dedup_thres_pcent * spp->pgs_per_lun * spp->luns_per_ptn);
     spp->memory_size = n->memory_size; // in ptn
+    spp->dedup_switch = n->dedup_switch;
 
     printf("spp->pgs_per_line: %d\n", spp->pgs_per_line);
     printf("spp->tt_lines: %d\n", spp->tt_lines);
@@ -1064,6 +1066,9 @@ static void *ftl_thread(void *arg)
     sprintf(ssd->info_file_name, "./SSDInfo_clean_%d.log", ssd->id);
     init_file(ssd->fp_info_clean, ssd->info_file_name);
     open_file(ssd->fp_info_clean, ssd->info_file_name, "a");
+    sprintf(ssd->info_file_name, "./SSDInfo_clean_test_%d.log", ssd->id);
+    init_file(ssd->fp_info_clean_test, ssd->info_file_name);
+    open_file(ssd->fp_info_clean_test, ssd->info_file_name, "a");
     // sprintf(ssd->latency_file_name, "./SSDLatency_%d.log", ssd->id);
     // init_file(ssd->fp_latency, ssd->latency_file_name);
     // open_file(ssd->fp_latency, ssd->latency_file_name, "a");
@@ -1134,29 +1139,31 @@ static void *ftl_thread(void *arg)
                 }
             }
         }
-        uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-        if (now < ssd->min_lun_avail_time) {
-            // 如果正在进行重删,继续处理
-            if (ssd->dedup_ctx.dedup_in_progress) {
-                ssd->time_for_dedup += (ssd->min_lun_avail_time - now) / 1e4;
-                do_dedup_partial(ssd);
-            } 
-            // 否则检查是否需要启动新的重删
-            else {
-                int dedup_ptn = ssd->next_dedup_ptn;
-                while(1){
-                    if (should_dedup(ssd, dedup_ptn)) {
-                        ssd->time_for_dedup += (ssd->min_lun_avail_time - now) / 1e4;
-                        ssd->dedup_ptn = dedup_ptn;
-                        ssd->dedup_cnt = 0;
-                        ssd->dedup_all = 0;
-                        ssd->next_dedup_ptn = (dedup_ptn + 1) % ssd->sp.tt_ptns;
-                        do_dedup_partial(ssd);
-                        break;
-                    }
-                    dedup_ptn = (dedup_ptn + 1) % ssd->sp.tt_ptns;
-                    if(dedup_ptn == ssd->next_dedup_ptn) {
-                        break;
+        if(ssd->sp.dedup_switch){
+            uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            if (now < ssd->min_lun_avail_time) {
+                // 如果正在进行重删,继续处理
+                if (ssd->dedup_ctx.dedup_in_progress) {
+                    ssd->time_for_dedup += (ssd->min_lun_avail_time - now) / 1e4;
+                    do_dedup_partial(ssd);
+                } 
+                // 否则检查是否需要启动新的重删
+                else {
+                    int dedup_ptn = ssd->next_dedup_ptn;
+                    while(1){
+                        if (should_dedup(ssd, dedup_ptn)) {
+                            ssd->time_for_dedup += (ssd->min_lun_avail_time - now) / 1e4;
+                            ssd->dedup_ptn = dedup_ptn;
+                            ssd->dedup_cnt = 0;
+                            ssd->dedup_all = 0;
+                            ssd->next_dedup_ptn = (dedup_ptn + 1) % ssd->sp.tt_ptns;
+                            do_dedup_partial(ssd);
+                            break;
+                        }
+                        dedup_ptn = (dedup_ptn + 1) % ssd->sp.tt_ptns;
+                        if(dedup_ptn == ssd->next_dedup_ptn) {
+                            break;
+                        }
                     }
                 }
             }
@@ -1538,6 +1545,7 @@ uint64_t ssd_trim(struct ssd *ssd, NvmeRequest *req)
 inline void printf_info(struct ssd *ssd, bool force_print)
 {
     int time_s = ssd->next_ssd_avail_time / 1e9;
+    FILE *clean_file;
     if (force_print || (ssd->test_begin && time_s > ssd->last_print_time_s)) {
         ssd->last_print_time_s = time_s;
         my_log(ssd->fp_info, "time:%d, \
@@ -1576,7 +1584,12 @@ inline void printf_info(struct ssd *ssd, bool force_print)
             ssd->g_malloc_FP_pages, ssd->g_free_FP_pages,
             ssd->cpu_cycle_tt);
 
-            my_log(ssd->fp_info_clean, "time:%d, \
+            if(ssd->warm_done == 0)
+                clean_file = ssd->fp_info_clean;
+            else 
+                clean_file = ssd->fp_info_clean_test;
+
+            my_log(clean_file, "time:%d, \
                 tt_IOs:(%d,%d),(%d,%d),(%d,%d),(%d,%d), \
                 tt_GC_IOs:(%d,%d,%d),(%d,%d,%d), \
                 tt_dedup:%d(%d), tt_dedup_handle:%d(%d), \
@@ -1625,6 +1638,33 @@ inline void printf_info(struct ssd *ssd, bool force_print)
         ssd->tt_trims[LAST_SECOND] = 0;
         ssd->tt_dedup[LAST_SECOND] = 0;
         ssd->tt_dedup_handle[LAST_SECOND] = 0;
+
+        if (ssd->warm_done ==0) {
+            open_file(ssd->warm_flag, "/data/hongyu1/share/warm_flag", "r");
+            if(ssd->warm_flag == NULL) 
+                printf("Error: cannot open warm_flag file!\n");
+            fscanf(ssd->warm_flag, "%d", &ssd->warm_done);
+            if (ssd->warm_done == 1) {
+                ssd->tt_IOs[TOTAL][NAND_READ][USER_IO] = ssd->tt_IOs[TOTAL][NAND_WRITE][USER_IO] = ssd->tt_IOs[TOTAL][NAND_READ][METADATA_IO] = ssd->tt_IOs[TOTAL][NAND_WRITE][METADATA_IO] = 0;
+                ssd->tt_GC_IOs[TOTAL][NAND_READ] = ssd->tt_GC_IOs[TOTAL][NAND_WRITE] = ssd->tt_GC_IOs[TOTAL][NAND_ERASE] = 0;
+                ssd->tt_dedup[TOTAL] = ssd->tt_dedup_handle[TOTAL] = 0;
+                ssd->time_for_dedup = 0;
+                ssd->tt_GC_IOs[TOTAL][3] = ssd->tt_GC_IOs[TOTAL][4] = 0;
+                ssd->tt_RMM_IOs[TOTAL][NAND_READ] = ssd->tt_RMM_IOs[TOTAL][NAND_WRITE] = 0;
+                ssd->tt_FP_IOs[TOTAL][NAND_READ] = ssd->tt_FP_IOs[TOTAL][NAND_WRITE] = 0;
+                ssd->tt_remaps[TOTAL] = 0; 
+                ssd->used_R_MapTable_entris = ssd->used_R_MapTable_parity_entris = ssd->valid_RMMs = ssd->valid_RMM_pages = 0;
+                ssd->valid_FPs = ssd->valid_FP_pages = 0;
+                ssd->tt_trims[TOTAL] = 0;
+                ssd->type_page_count[metapage] = 0; 
+                ssd->type_page_count[userpage] = 0; 
+                ssd->type_page_count[RMMpage] = 0; 
+                ssd->type_page_count[FPpage] = 0; 
+                ssd->g_malloc_RMM_pages = ssd->g_free_RMM_pages = 0;
+                ssd->g_malloc_FP_pages = ssd->g_free_FP_pages = 0;
+            }
+            fclose(ssd->warm_flag);
+        }
     }
 }
 
@@ -2435,8 +2475,14 @@ static void handle_duplicate_page(struct ssd *ssd, struct ppa *exist_ppa, struct
         elem.RMM_page_p = NULL;
         elem.FP_page_p = NULL;
 
-        if(old_ppa->ppa != get_maptbl_ent(ssd, elem.lpn, false).ppa)
-            my_log(ssd->fp_info, "Error: old_ppa != get_maptbl_ent(ssd, elem.lpn, false).ppa in handle_duplicate_page\n");
+        if(old_ppa->ppa != get_maptbl_ent(ssd, elem.lpn, false).ppa){
+            my_log(ssd->fp_info, "Error: old_ppa != get_maptbl_ent in handle_duplicate_page. old_ppa->ppa=%lu, rmap->lpn = %d, get_maptbl_ent = %lu\n", old_ppa->ppa, rmap->lpn, get_maptbl_ent(ssd, elem.lpn, false).ppa);
+            struct ppa now = get_maptbl_ent(ssd, elem.lpn, false);
+            my_log(ssd->fp_info, "old_ppa: blk = %d, pg = %d, sec = %d, pl = %d, lun = %d, ch = %d\n", old_ppa->g.blk, old_ppa->g.pg, old_ppa->g.sec, old_ppa->g.pl, old_ppa->g.lun, old_ppa->g.ch);
+            my_log(ssd->fp_info, "now_ppa: blk = %d, pg = %d, sec = %d, pl = %d, lun = %d, ch = %d\n", now.g.blk, now.g.pg, now.g.sec, now.g.pl, now.g.lun, now.g.ch);
+            rmap = rmap->next;
+            continue;
+        }
         // if (mapped_ppa(old_ppa)) {
         delete_reference(ssd, false, old_ppa, elem);
         // }

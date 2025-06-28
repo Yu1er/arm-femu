@@ -966,6 +966,7 @@ typedef struct FemuCtrl {
     uint32_t        luns_per_ptn;
     uint32_t        dedup_thres_pcent;
     uint32_t        memory_size;
+    uint32_t        dedup_switch;
 
     char            devname[64];
     struct rte_ring *to_ftl;
