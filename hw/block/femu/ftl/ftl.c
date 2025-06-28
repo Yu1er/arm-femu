@@ -5,6 +5,7 @@
 #include "../nvme.h"
 #include "ftl.h"
 #include <execinfo.h>
+#include <stdint.h>
 #include "MD5.h"
 #include "btree.h"
 
@@ -396,6 +397,7 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
     spp->dedup_thres_writes = (int)(spp->dedup_thres_pcent * spp->pgs_per_lun * spp->luns_per_ptn);
     spp->memory_size = n->memory_size; // in ptn
     spp->dedup_switch = n->dedup_switch;
+    strcpy(spp->warm_flag_file, n->warm_flag_file);
 
     printf("spp->pgs_per_line: %d\n", spp->pgs_per_line);
     printf("spp->tt_lines: %d\n", spp->tt_lines);
@@ -1550,49 +1552,48 @@ uint64_t ssd_trim(struct ssd *ssd, NvmeRequest *req)
 inline void printf_info(struct ssd *ssd, bool force_print)
 {
     int time_s = ssd->next_ssd_avail_time / 1e9;
-    FILE *clean_file;
+    FILE *clean_file = (ssd->warm_done == 0) ? ssd->fp_info_clean : ssd->fp_info_clean_test;
     if (force_print || (ssd->test_begin && time_s > ssd->last_print_time_s)) {
+        uint64_t last_user_IOs = ssd->tt_IOs[LAST_SECOND][NAND_READ][USER_IO] + ssd->tt_IOs[LAST_SECOND][NAND_WRITE][USER_IO]+ssd->tt_IOs[LAST_SECOND][NAND_READ][METADATA_IO] + ssd->tt_IOs[LAST_SECOND][NAND_WRITE][METADATA_IO];
+        uint64_t last_GC_IOs = ssd->tt_GC_IOs[LAST_SECOND][NAND_READ] + ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE] + ssd->tt_GC_IOs[LAST_SECOND][NAND_ERASE];
         ssd->last_print_time_s = time_s;
-        my_log(ssd->fp_info, "time:%d, \
-            tt_IOs:(%d,%d),(%d,%d),(%d,%d),(%d,%d), \
-            tt_GC_IOs:(%d,%d,%d),(%d,%d,%d), \
-            tt_dedup:%d(%d), tt_dedup_handle:%d(%d), \
-            time_for_dedup:%d, \
-            tt_FP_GC_IOs:(%d,%d),(%d,%d), \
-            tt_RMM_IOs:(%d,%d),(%d,%d), \
-            tt_FP_IOs:(%d,%d),(%d,%d), \
-            tt_remaps:%d(%d), \
-            R_MapTable_entris:%d(%d), RMMs:%d, RMM_pages:%d, \
-            valid_FPs:%d, valid_FP_pages:%d, \
-            TRIMs:%d(%d), \
-            metadata_pages:%d(%.2fGB), user_pages:%d(%.2fGB), RMM_pages:%d(%.2fGB), FP_pages:%d(%.2fGB),\
-            RMM_pages:(malloc,%d)(free,%d),\
-            FP_pages:(malloc,%d)(free,%d),\
-            cpu_cycle_tt:%ld\n",
-            time_s, 
-            ssd->tt_IOs[TOTAL][NAND_READ][USER_IO], ssd->tt_IOs[TOTAL][NAND_WRITE][USER_IO], ssd->tt_IOs[LAST_SECOND][NAND_READ][USER_IO], ssd->tt_IOs[LAST_SECOND][NAND_WRITE][USER_IO], ssd->tt_IOs[TOTAL][NAND_READ][METADATA_IO], ssd->tt_IOs[TOTAL][NAND_WRITE][METADATA_IO], ssd->tt_IOs[LAST_SECOND][NAND_READ][METADATA_IO], ssd->tt_IOs[LAST_SECOND][NAND_WRITE][METADATA_IO],
-            ssd->tt_GC_IOs[TOTAL][NAND_READ], ssd->tt_GC_IOs[TOTAL][NAND_WRITE], ssd->tt_GC_IOs[TOTAL][NAND_ERASE], ssd->tt_GC_IOs[LAST_SECOND][NAND_READ], ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE], ssd->tt_GC_IOs[LAST_SECOND][NAND_ERASE],
-            ssd->tt_dedup[TOTAL], ssd->tt_dedup[LAST_SECOND], ssd->tt_dedup_handle[TOTAL], ssd->tt_dedup_handle[LAST_SECOND],
-            ssd->time_for_dedup,
-            ssd->tt_GC_IOs[TOTAL][3], ssd->tt_GC_IOs[TOTAL][4], ssd->tt_GC_IOs[LAST_SECOND][3], ssd->tt_GC_IOs[LAST_SECOND][4],
-            ssd->tt_RMM_IOs[TOTAL][NAND_READ], ssd->tt_RMM_IOs[TOTAL][NAND_WRITE], ssd->tt_RMM_IOs[LAST_SECOND][NAND_READ], ssd->tt_RMM_IOs[LAST_SECOND][NAND_WRITE],
-            ssd->tt_FP_IOs[TOTAL][NAND_READ], ssd->tt_FP_IOs[TOTAL][NAND_WRITE], ssd->tt_FP_IOs[LAST_SECOND][NAND_READ], ssd->tt_FP_IOs[LAST_SECOND][NAND_WRITE],
-            ssd->tt_remaps[TOTAL], ssd->tt_remaps[LAST_SECOND], 
-            ssd->used_R_MapTable_entris, ssd->used_R_MapTable_parity_entris, ssd->valid_RMMs, ssd->valid_RMM_pages,
-            ssd->valid_FPs, ssd->valid_FP_pages,
-            ssd->tt_trims[TOTAL], ssd->tt_trims[LAST_SECOND],
-            ssd->type_page_count[metapage], (float)ssd->type_page_count[metapage]*4/1024/1024, 
-            ssd->type_page_count[userpage], (float)ssd->type_page_count[userpage]*4/1024/1024,
-            ssd->type_page_count[RMMpage], (float)ssd->type_page_count[RMMpage]*4/1024/1024,
-            ssd->type_page_count[FPpage], (float)ssd->type_page_count[FPpage]*4/1024/1024,
-            ssd->g_malloc_RMM_pages, ssd->g_free_RMM_pages,
-            ssd->g_malloc_FP_pages, ssd->g_free_FP_pages,
-            ssd->cpu_cycle_tt);
 
-            if(ssd->warm_done == 0)
-                clean_file = ssd->fp_info_clean;
-            else 
-                clean_file = ssd->fp_info_clean_test;
+        if (last_user_IOs + last_GC_IOs != 0) {
+            my_log(ssd->fp_info, "time:%d, \
+                tt_IOs:(%d,%d),(%d,%d),(%d,%d),(%d,%d), \
+                tt_GC_IOs:(%d,%d,%d),(%d,%d,%d), \
+                tt_dedup:%d(%d), tt_dedup_handle:%d(%d), \
+                time_for_dedup:%d, \
+                tt_FP_GC_IOs:(%d,%d),(%d,%d), \
+                tt_RMM_IOs:(%d,%d),(%d,%d), \
+                tt_FP_IOs:(%d,%d),(%d,%d), \
+                tt_remaps:%d(%d), \
+                R_MapTable_entris:%d(%d), RMMs:%d, RMM_pages:%d, \
+                valid_FPs:%d, valid_FP_pages:%d, \
+                TRIMs:%d(%d), \
+                metadata_pages:%d(%.2fGB), user_pages:%d(%.2fGB), RMM_pages:%d(%.2fGB), FP_pages:%d(%.2fGB),\
+                RMM_pages:(malloc,%d)(free,%d),\
+                FP_pages:(malloc,%d)(free,%d),\
+                cpu_cycle_tt:%ld\n",
+                time_s, 
+                ssd->tt_IOs[TOTAL][NAND_READ][USER_IO], ssd->tt_IOs[TOTAL][NAND_WRITE][USER_IO], ssd->tt_IOs[LAST_SECOND][NAND_READ][USER_IO], ssd->tt_IOs[LAST_SECOND][NAND_WRITE][USER_IO], ssd->tt_IOs[TOTAL][NAND_READ][METADATA_IO], ssd->tt_IOs[TOTAL][NAND_WRITE][METADATA_IO], ssd->tt_IOs[LAST_SECOND][NAND_READ][METADATA_IO], ssd->tt_IOs[LAST_SECOND][NAND_WRITE][METADATA_IO],
+                ssd->tt_GC_IOs[TOTAL][NAND_READ], ssd->tt_GC_IOs[TOTAL][NAND_WRITE], ssd->tt_GC_IOs[TOTAL][NAND_ERASE], ssd->tt_GC_IOs[LAST_SECOND][NAND_READ], ssd->tt_GC_IOs[LAST_SECOND][NAND_WRITE], ssd->tt_GC_IOs[LAST_SECOND][NAND_ERASE],
+                ssd->tt_dedup[TOTAL], ssd->tt_dedup[LAST_SECOND], ssd->tt_dedup_handle[TOTAL], ssd->tt_dedup_handle[LAST_SECOND],
+                ssd->time_for_dedup,
+                ssd->tt_GC_IOs[TOTAL][3], ssd->tt_GC_IOs[TOTAL][4], ssd->tt_GC_IOs[LAST_SECOND][3], ssd->tt_GC_IOs[LAST_SECOND][4],
+                ssd->tt_RMM_IOs[TOTAL][NAND_READ], ssd->tt_RMM_IOs[TOTAL][NAND_WRITE], ssd->tt_RMM_IOs[LAST_SECOND][NAND_READ], ssd->tt_RMM_IOs[LAST_SECOND][NAND_WRITE],
+                ssd->tt_FP_IOs[TOTAL][NAND_READ], ssd->tt_FP_IOs[TOTAL][NAND_WRITE], ssd->tt_FP_IOs[LAST_SECOND][NAND_READ], ssd->tt_FP_IOs[LAST_SECOND][NAND_WRITE],
+                ssd->tt_remaps[TOTAL], ssd->tt_remaps[LAST_SECOND], 
+                ssd->used_R_MapTable_entris, ssd->used_R_MapTable_parity_entris, ssd->valid_RMMs, ssd->valid_RMM_pages,
+                ssd->valid_FPs, ssd->valid_FP_pages,
+                ssd->tt_trims[TOTAL], ssd->tt_trims[LAST_SECOND],
+                ssd->type_page_count[metapage], (float)ssd->type_page_count[metapage]*4/1024/1024, 
+                ssd->type_page_count[userpage], (float)ssd->type_page_count[userpage]*4/1024/1024,
+                ssd->type_page_count[RMMpage], (float)ssd->type_page_count[RMMpage]*4/1024/1024,
+                ssd->type_page_count[FPpage], (float)ssd->type_page_count[FPpage]*4/1024/1024,
+                ssd->g_malloc_RMM_pages, ssd->g_free_RMM_pages,
+                ssd->g_malloc_FP_pages, ssd->g_free_FP_pages,
+                ssd->cpu_cycle_tt);
 
             my_log(clean_file, "time:%d, \
                 tt_IOs:(%d,%d),(%d,%d),(%d,%d),(%d,%d), \
@@ -1629,6 +1630,7 @@ inline void printf_info(struct ssd *ssd, bool force_print)
                 ssd->g_malloc_RMM_pages, ssd->g_free_RMM_pages,
                 ssd->g_malloc_FP_pages, ssd->g_free_FP_pages,
                 ssd->cpu_cycle_tt);
+        }
 
         // for(int i=0;i<ssd->sp.tt_ptns;i++) {
         //     my_log(ssd->fp_info, "ptn_%d = %d, ", i, ssd->ptns[i]);
@@ -1645,11 +1647,9 @@ inline void printf_info(struct ssd *ssd, bool force_print)
         ssd->tt_dedup_handle[LAST_SECOND] = 0;
 
         if (ssd->warm_done ==0) {
-            open_file(ssd->warm_flag, "/data/hongyu1/share/warm_flag", "r");
-            if(ssd->warm_flag == NULL) 
-                printf("Error: cannot open warm_flag file!\n");
-            fscanf(ssd->warm_flag, "%d", &ssd->warm_done);
-            if (ssd->warm_done == 1) {
+            open_file(ssd->warm_flag, ssd->sp.warm_flag_file, "r");
+            if(ssd->warm_flag != NULL){
+                ssd->warm_done = 1;
                 ssd->tt_IOs[TOTAL][NAND_READ][USER_IO] = ssd->tt_IOs[TOTAL][NAND_WRITE][USER_IO] = ssd->tt_IOs[TOTAL][NAND_READ][METADATA_IO] = ssd->tt_IOs[TOTAL][NAND_WRITE][METADATA_IO] = 0;
                 ssd->tt_GC_IOs[TOTAL][NAND_READ] = ssd->tt_GC_IOs[TOTAL][NAND_WRITE] = ssd->tt_GC_IOs[TOTAL][NAND_ERASE] = 0;
                 ssd->tt_dedup[TOTAL] = ssd->tt_dedup_handle[TOTAL] = 0;
@@ -1667,8 +1667,8 @@ inline void printf_info(struct ssd *ssd, bool force_print)
                 ssd->type_page_count[FPpage] = 0; 
                 ssd->g_malloc_RMM_pages = ssd->g_free_RMM_pages = 0;
                 ssd->g_malloc_FP_pages = ssd->g_free_FP_pages = 0;
+                fclose(ssd->warm_flag);
             }
-            fclose(ssd->warm_flag);
         }
     }
 }

@@ -233,6 +233,7 @@ struct ssdparams {
     int dedup_thres_writes;
     int memory_size;
     int dedup_switch;
+    char warm_flag_file[255]; // warm flag file name
 };
 
 typedef struct line {
